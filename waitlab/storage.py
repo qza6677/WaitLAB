@@ -442,6 +442,15 @@ class Storage:
             )
         return total
 
+    def today_completed_titles(self, now: datetime | None = None) -> list[str]:
+        current = now or utc_now()
+        day_start = current.replace(hour=0, minute=0, second=0, microsecond=0)
+        rows = self._connection.execute(
+            "SELECT task_title FROM focus_sessions WHERE outcome = 'completed' AND ended_at >= ? ORDER BY ended_at DESC",
+            (to_iso(day_start),),
+        ).fetchall()
+        return [str(row["task_title"]) for row in rows]
+
     def get_setting(self, key: str, default: str = "") -> str:
         row = self._connection.execute("SELECT value FROM settings WHERE key = ?", (key,)).fetchone()
         return row["value"] if row else default

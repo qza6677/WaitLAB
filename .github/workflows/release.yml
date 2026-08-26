@@ -65,4 +65,3 @@ jobs:
             .\release\SHA256SUMS.txt `
             --title "WaitLAB $tag" `
             --generate-notes
-

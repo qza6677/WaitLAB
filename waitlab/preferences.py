@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import datetime, time
 from enum import StrEnum
 
 from .storage import Storage
@@ -22,6 +23,11 @@ class Preferences:
     popup_mode: PopupMode = PopupMode.RAISE
     completion_notifications: bool = True
     notification_sound: bool = True
+    always_on_top: bool = True
+    auto_check_updates: bool = True
+    quiet_hours_enabled: bool = False
+    quiet_start: str = "22:00"
+    quiet_end: str = "08:00"
 
     @classmethod
     def load(cls, storage: Storage) -> "Preferences":
@@ -38,6 +44,11 @@ class Preferences:
                 True,
             ),
             notification_sound=_read_bool(storage, "notification_sound", True),
+            always_on_top=_read_bool(storage, "always_on_top", True),
+            auto_check_updates=_read_bool(storage, "auto_check_updates", True),
+            quiet_hours_enabled=_read_bool(storage, "quiet_hours_enabled", False),
+            quiet_start=storage.get_setting("quiet_start", "22:00"),
+            quiet_end=storage.get_setting("quiet_end", "08:00"),
         )
 
     def save(self, storage: Storage) -> None:
@@ -50,3 +61,22 @@ class Preferences:
             "notification_sound",
             "1" if self.notification_sound else "0",
         )
+        for key, enabled in (
+            ("always_on_top", self.always_on_top),
+            ("auto_check_updates", self.auto_check_updates),
+            ("quiet_hours_enabled", self.quiet_hours_enabled),
+        ):
+            storage.set_setting(key, "1" if enabled else "0")
+        storage.set_setting("quiet_start", self.quiet_start)
+        storage.set_setting("quiet_end", self.quiet_end)
+
+    def is_quiet_now(self, now: time | None = None) -> bool:
+        if not self.quiet_hours_enabled:
+            return False
+        try:
+            start = time.fromisoformat(self.quiet_start)
+            end = time.fromisoformat(self.quiet_end)
+        except ValueError:
+            return False
+        current = now or datetime.now().time()
+        return start <= current < end if start <= end else current >= start or current < end

@@ -16,11 +16,11 @@ VSVersionInfo(
         [
           StringStruct(u'CompanyName', u'WaitLAB'),
           StringStruct(u'FileDescription', u'WaitLAB 科研等待助手'),
-          StringStruct(u'FileVersion', u'0.4.0'),
+          StringStruct(u'FileVersion', u'0.5.2'),
           StringStruct(u'InternalName', u'WaitLAB'),
           StringStruct(u'OriginalFilename', u'WaitLAB.exe'),
           StringStruct(u'ProductName', u'WaitLAB'),
-          StringStruct(u'ProductVersion', u'0.4.0')
+          StringStruct(u'ProductVersion', u'0.5.2')
         ]
       )
     ]),

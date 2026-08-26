@@ -2,12 +2,13 @@ from __future__ import annotations
 
 import math
 import time
+from threading import Thread
 from datetime import datetime
 from enum import StrEnum
 from pathlib import Path
 
-from PySide6.QtCore import QPoint, QRectF, Qt, QTimer, Signal
-from PySide6.QtGui import QColor, QFont, QIcon, QMouseEvent, QPainter, QPainterPath, QPen, QPixmap
+from PySide6.QtCore import QPoint, QRectF, Qt, QTime, QTimer, Signal
+from PySide6.QtGui import QColor, QFont, QIcon, QKeyEvent, QMouseEvent, QPainter, QPainterPath, QPen, QPixmap
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QApplication,
@@ -27,6 +28,7 @@ from PySide6.QtWidgets import (
     QPushButton,
     QSizePolicy,
     QSystemTrayIcon,
+    QTimeEdit,
     QVBoxLayout,
     QWidget,
 )
@@ -38,6 +40,8 @@ from .models import DefaultTaskEntry, ServiceUpdate, Task, TaskKind, utc_now
 from .preferences import PopupMode, Preferences
 from .service import WaitLabService
 from .storage import DEFAULT_TASKS
+from . import __version__
+from .updates import ReleaseInfo, download_verified_installer, fetch_latest_release, launch_installer
 
 
 COLORS = {
@@ -293,6 +297,22 @@ class TaskManagerDialog(QDialog):
         self.refresh()
         self.tasks_changed.emit()
 
+    def _selected_task(self) -> Task | None:
+        item = self.list_widget.currentItem()
+        return item.data(Qt.ItemDataRole.UserRole) if item is not None else None
+
+    def _start_selected(self) -> None:
+        task = self._selected_task()
+        if task is not None:
+            self.task_started.emit(task)
+
+    def _delete_selected(self) -> None:
+        task = self._selected_task()
+        if task is not None and task.id is not None:
+            self.service.storage.delete_manual_task(task.id)
+            self.refresh()
+            self.tasks_changed.emit()
+
 
 class SettingsDialog(QDialog):
     settings_changed = Signal()
@@ -328,11 +348,28 @@ class SettingsDialog(QDialog):
         self.completion_notifications = QCheckBox("Codex 完成或中断时显示系统通知")
         self.notification_sound = QCheckBox("提醒时播放提示音")
         self.autostart = QCheckBox("登录 Windows 后自动启动 WaitLAB")
+        self.always_on_top = QCheckBox("悬浮窗始终置顶（可随时拖动）")
+        self.auto_check_updates = QCheckBox("启动时检查 GitHub 新版本")
+        self.quiet_hours = QCheckBox("静默时段不发送系统通知")
+        self.quiet_start = QTimeEdit()
+        self.quiet_end = QTimeEdit()
+        self.quiet_start.setDisplayFormat("HH:mm")
+        self.quiet_end.setDisplayFormat("HH:mm")
+        quiet_row = QHBoxLayout()
+        quiet_row.addWidget(self.quiet_hours)
+        quiet_row.addStretch()
+        quiet_row.addWidget(QLabel("从"))
+        quiet_row.addWidget(self.quiet_start)
+        quiet_row.addWidget(QLabel("到"))
+        quiet_row.addWidget(self.quiet_end)
         layout.addWidget(QLabel("收到新的 Codex 指令时："))
         layout.addWidget(self.popup_mode)
         layout.addWidget(self.completion_notifications)
         layout.addWidget(self.notification_sound)
         layout.addWidget(self.autostart)
+        layout.addWidget(self.always_on_top)
+        layout.addWidget(self.auto_check_updates)
+        layout.addLayout(quiet_row)
 
         fixed_header = QHBoxLayout()
         fixed_title = QLabel("固定循环任务")
@@ -387,6 +424,11 @@ class SettingsDialog(QDialog):
         self.completion_notifications.setChecked(preferences.completion_notifications)
         self.notification_sound.setChecked(preferences.notification_sound)
         self.autostart.setChecked(is_autostart_enabled())
+        self.always_on_top.setChecked(preferences.always_on_top)
+        self.auto_check_updates.setChecked(preferences.auto_check_updates)
+        self.quiet_hours.setChecked(preferences.quiet_hours_enabled)
+        self.quiet_start.setTime(QTime.fromString(preferences.quiet_start, "HH:mm"))
+        self.quiet_end.setTime(QTime.fromString(preferences.quiet_end, "HH:mm"))
         self._fill_fixed_tasks(self.service.storage.default_task_entries())
 
     def _fill_fixed_tasks(self, entries: list[DefaultTaskEntry]) -> None:
@@ -485,6 +527,11 @@ class SettingsDialog(QDialog):
             popup_mode=PopupMode(str(self.popup_mode.currentData())),
             completion_notifications=self.completion_notifications.isChecked(),
             notification_sound=self.notification_sound.isChecked(),
+            always_on_top=self.always_on_top.isChecked(),
+            auto_check_updates=self.auto_check_updates.isChecked(),
+            quiet_hours_enabled=self.quiet_hours.isChecked(),
+            quiet_start=self.quiet_start.time().toString("HH:mm"),
+            quiet_end=self.quiet_end.time().toString("HH:mm"),
         )
         try:
             set_autostart(self.autostart.isChecked())
@@ -496,28 +543,11 @@ class SettingsDialog(QDialog):
         self.settings_changed.emit()
         self.accept()
 
-    def _selected_task(self) -> Task | None:
-        item = self.list_widget.currentItem()
-        if item is None:
-            return None
-        return item.data(Qt.ItemDataRole.UserRole)
-
-    def _start_selected(self) -> None:
-        task = self._selected_task()
-        if task is not None:
-            self.task_started.emit(task)
-
-    def _delete_selected(self) -> None:
-        task = self._selected_task()
-        if task is None or task.id is None:
-            return
-        self.service.storage.delete_manual_task(task.id)
-        self.refresh()
-        self.tasks_changed.emit()
-
-
 class PetWindow(QWidget):
     quit_requested = Signal()
+    update_check_finished = Signal(str)
+    update_available = Signal(object, bool)
+    update_downloaded = Signal(object)
 
     def __init__(self, service: WaitLabService) -> None:
         super().__init__()
@@ -543,18 +573,23 @@ class PetWindow(QWidget):
         self.setWindowIcon(app_icon())
         self.setWindowFlags(
             Qt.WindowType.FramelessWindowHint
-            | Qt.WindowType.WindowStaysOnTopHint
             | Qt.WindowType.Tool
         )
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
         self.setFixedWidth(82)
         self._build_ui()
+        self.update_check_finished.connect(self._show_update_result)
+        self.update_available.connect(self._offer_update)
+        self.update_downloaded.connect(self._install_downloaded_update)
+        self._apply_window_preferences()
         self._restore_position()
 
         self.timer = QTimer(self)
         self.timer.timeout.connect(self.refresh)
         self.timer.start(250)
         self.refresh()
+        if Preferences.load(self.service.storage).auto_check_updates:
+            QTimer.singleShot(3500, lambda: self.check_for_updates(silent=True))
 
     def _build_ui(self) -> None:
         outer = QVBoxLayout(self)
@@ -629,25 +664,26 @@ class PetWindow(QWidget):
         focus_info.setSpacing(1)
         self.focus_title = QLabel()
         self.focus_title.setObjectName("focusTitle")
-        self.focus_title.setFixedWidth(165)
+        self.focus_title.setFixedWidth(112)
         self.focus_time = QLabel("00:00")
         self.focus_time.setObjectName("timerCompact")
         focus_info.addWidget(self.focus_title)
         focus_info.addWidget(self.focus_time)
         focus_layout.addLayout(focus_info, 1)
-        self.pause_button = QPushButton("暂停")
+        self.pause_button = QPushButton("Ⅱ\n暂停")
         self.pause_button.setObjectName("playerButton")
         self.pause_button.setToolTip("暂停或继续微任务")
         self.pause_button.clicked.connect(self.toggle_pause)
-        complete_button = QPushButton("完成")
+        complete_button = QPushButton("✓\n完成")
         complete_button.setObjectName("playerPrimaryButton")
         complete_button.setToolTip("完成当前微任务")
         complete_button.clicked.connect(self.complete_focus)
-        abandon_button = QPushButton("×")
+        abandon_button = QPushButton("×\n取消")
         abandon_button.setObjectName("playerCloseButton")
         abandon_button.setToolTip("取消本次计时并放回任务池")
-        abandon_button.setFixedWidth(30)
         abandon_button.clicked.connect(self.abandon_focus)
+        for button in (self.pause_button, complete_button, abandon_button):
+            button.setFixedSize(44, 48)
         focus_layout.addWidget(self.pause_button)
         focus_layout.addWidget(complete_button)
         focus_layout.addWidget(abandon_button)
@@ -684,6 +720,15 @@ class PetWindow(QWidget):
         picker_header.addStretch()
         picker_header.addWidget(self.picker_source)
         picker_layout.addLayout(picker_header)
+        add_row = QHBoxLayout()
+        self.quick_task_input = QLineEdit()
+        self.quick_task_input.setPlaceholderText("新增一个具体任务…")
+        self.quick_task_input.returnPressed.connect(self._add_quick_task)
+        add_quick = QPushButton("新增")
+        add_quick.clicked.connect(self._add_quick_task)
+        add_row.addWidget(self.quick_task_input, 1)
+        add_row.addWidget(add_quick)
+        picker_layout.addLayout(add_row)
         self.suggestion_container = QWidget()
         self.suggestion_container.setSizePolicy(
             QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Maximum
@@ -692,6 +737,10 @@ class PetWindow(QWidget):
         self.suggestion_layout.setContentsMargins(0, 0, 0, 0)
         self.suggestion_layout.setSpacing(7)
         picker_layout.addWidget(self.suggestion_container)
+        self.today_completed_label = QLabel()
+        self.today_completed_label.setObjectName("muted")
+        self.today_completed_label.setWordWrap(True)
+        picker_layout.addWidget(self.today_completed_label)
         later_button = QPushButton("本轮跳过")
         later_button.setObjectName("linkButton")
         later_button.clicked.connect(self.skip_current_round)
@@ -823,7 +872,7 @@ class PetWindow(QWidget):
             if self.service.focus is None:
                 self.task_picker_open = False
             preferences = Preferences.load(self.service.storage)
-            if preferences.completion_notifications:
+            if preferences.completion_notifications and not preferences.is_quiet_now():
                 if self.tray is not None:
                     self.tray.showMessage(
                         "Codex 已完成" if update.ai_completed else "Codex 已中断",
@@ -844,7 +893,7 @@ class PetWindow(QWidget):
                 self._play_notification_sound(preferences)
         if update.ai_needs_attention:
             preferences = Preferences.load(self.service.storage)
-            if self.tray is not None:
+            if self.tray is not None and not preferences.is_quiet_now():
                 self.tray.showMessage(
                     "Codex 等待批准",
                     "请回到 Codex 处理权限请求；当前微任务仍在继续计时。",
@@ -856,7 +905,7 @@ class PetWindow(QWidget):
 
     @staticmethod
     def _play_notification_sound(preferences: Preferences) -> None:
-        if preferences.notification_sound:
+        if preferences.notification_sound and not preferences.is_quiet_now():
             QApplication.beep()
 
     def refresh(self) -> None:
@@ -973,7 +1022,7 @@ class PetWindow(QWidget):
             margins = (4, 4, 4, 4)
             opacity = 0.88
         elif mode is PresentationMode.PLAYER:
-            width = 410
+            width = 340
             margins = (7, 6, 7, 6)
             opacity = 0.96
         else:
@@ -990,7 +1039,7 @@ class PetWindow(QWidget):
         self.card.layout().invalidate()
         self.card.layout().activate()
         QTimer.singleShot(0, self._fit_to_content)
-        QTimer.singleShot(0, self._snap_to_left_edge)
+        QTimer.singleShot(0, self._keep_on_screen)
 
     def _update_connection_status(self, force: bool = False) -> None:
         current = time.monotonic()
@@ -1058,7 +1107,9 @@ class PetWindow(QWidget):
         dialog.exec()
 
     def _refresh_suggestions(self) -> None:
-        tasks = self.service.suggested_tasks()
+        manual = self.service.storage.list_manual_tasks()
+        defaults = [Task(None, entry.title, TaskKind.DEFAULT) for entry in self.service.storage.default_task_entries() if entry.enabled]
+        tasks = manual + defaults[:3]
         signature = tuple((task.id, task.title, task.kind.value) for task in tasks)
         if signature == self._suggestion_signature:
             return
@@ -1068,8 +1119,7 @@ class PetWindow(QWidget):
             widget = item.widget()
             if widget is not None:
                 widget.deleteLater()
-        source = "手动任务" if tasks and tasks[0].kind is TaskKind.MANUAL else "固定循环"
-        self.picker_source.setText(source)
+        self.picker_source.setText("我的任务 + 随机任务")
         if not tasks:
             empty = QLabel("暂无可用任务。请添加手动任务，或在设置中启用固定任务。")
             empty.setObjectName("muted")
@@ -1079,8 +1129,14 @@ class PetWindow(QWidget):
             configure.clicked.connect(self.open_settings)
             self.suggestion_layout.addWidget(configure)
             return
-        for task in tasks:
-            button = QPushButton(task.title)
+        current_kind = None
+        for index, task in enumerate(tasks, start=1):
+            if task.kind is not current_kind:
+                current_kind = task.kind
+                section = QLabel("我的具体任务" if task.kind is TaskKind.MANUAL else "随机循环任务")
+                section.setObjectName("muted")
+                self.suggestion_layout.addWidget(section)
+            button = QPushButton(f"{index} · {task.title}")
             button.setObjectName("taskButton")
             button.setCursor(Qt.CursorShape.PointingHandCursor)
             button.clicked.connect(lambda _checked=False, selected=task: self.start_focus(selected))
@@ -1090,6 +1146,18 @@ class PetWindow(QWidget):
         self.picker.layout().invalidate()
         self.picker.updateGeometry()
         self.card.layout().invalidate()
+        completed = self.service.storage.today_completed_titles()
+        self.today_completed_label.setText("今日已完成：" + "、".join(completed[:5]) if completed else "今日还没有完成微任务")
+
+    def _add_quick_task(self) -> None:
+        try:
+            task = self.service.storage.add_manual_task(self.quick_task_input.text())
+        except ValueError:
+            self.quick_task_input.setFocus()
+            return
+        self.quick_task_input.clear()
+        self._suggestion_signature = None
+        self.start_focus(task)
 
     def start_focus(self, task: Task) -> None:
         if self.service.focus is not None:
@@ -1106,6 +1174,9 @@ class PetWindow(QWidget):
 
     def complete_focus(self) -> None:
         self.apply_update(self.service.complete_focus())
+        self.completion_banner_until = time.monotonic() + 2.5
+        self.task_picker_open = True
+        QApplication.beep()
         self._suggestion_signature = None
         if self.task_dialog is not None:
             self.task_dialog.refresh()
@@ -1125,6 +1196,29 @@ class PetWindow(QWidget):
             self.task_picker_open = not self.task_picker_open
             self.refresh()
 
+    def keyPressEvent(self, event: QKeyEvent) -> None:  # noqa: N802
+        if self.service.focus is not None:
+            if event.key() == Qt.Key.Key_Space:
+                self.toggle_pause()
+                event.accept()
+                return
+            if event.key() in {Qt.Key.Key_Return, Qt.Key.Key_Enter}:
+                self.complete_focus()
+                event.accept()
+                return
+        elif self.task_picker_open and Qt.Key.Key_1 <= event.key() <= Qt.Key.Key_3:
+            tasks = self.service.suggested_tasks()
+            index = event.key() - Qt.Key.Key_1
+            if index < len(tasks):
+                self.start_focus(tasks[index])
+                event.accept()
+                return
+        if event.key() == Qt.Key.Key_Escape:
+            self.close_picker()
+            event.accept()
+            return
+        super().keyPressEvent(event)
+
     def show_pet_menu(self, global_position: QPoint) -> None:
         menu = QMenu(self)
         if self.service.focus is not None:
@@ -1143,6 +1237,8 @@ class PetWindow(QWidget):
         tasks_action.triggered.connect(self.open_task_manager)
         settings_action = menu.addAction("设置")
         settings_action.triggered.connect(self.open_settings)
+        update_action = menu.addAction("检查更新")
+        update_action.triggered.connect(self.check_for_updates)
         menu.addSeparator()
         hide_action = menu.addAction("隐藏到托盘")
         hide_action.triggered.connect(self.hide)
@@ -1210,6 +1306,56 @@ class PetWindow(QWidget):
         if self.task_dialog is not None:
             self.task_dialog.refresh()
         self.last_message = "设置已保存"
+        self._apply_window_preferences()
+        self.refresh()
+
+    def _apply_window_preferences(self) -> None:
+        preferences = Preferences.load(self.service.storage)
+        self.setWindowFlag(Qt.WindowType.WindowStaysOnTopHint, preferences.always_on_top)
+        self.show()
+
+    def check_for_updates(self, silent: bool = False) -> None:
+        def worker() -> None:
+            try:
+                release = fetch_latest_release(__version__)
+                if release is not None:
+                    self.update_available.emit(release, silent)
+                elif not silent:
+                    self.update_check_finished.emit("当前已是最新版本")
+            except Exception:
+                if not silent:
+                    self.update_check_finished.emit("暂时无法检查更新，请稍后重试")
+        Thread(target=worker, daemon=True).start()
+
+    def _offer_update(self, release: ReleaseInfo, silent: bool) -> None:
+        if self.service.focus is not None:
+            self._show_update_result(f"发现 {release.version}；当前任务结束后可一键更新")
+            return
+        if silent:
+            self._show_update_result(f"发现 WaitLAB {release.version}，右键桌宠可开始更新")
+            return
+        answer = QMessageBox.question(self, "更新 WaitLAB", f"发现版本 {release.version}。现在下载、校验并安装吗？")
+        if answer != QMessageBox.StandardButton.Yes:
+            return
+        self._show_update_result("正在下载并校验更新…")
+        def worker() -> None:
+            try:
+                self.update_downloaded.emit(download_verified_installer(release))
+            except Exception as exc:
+                self.update_check_finished.emit(f"更新失败：{exc}")
+        Thread(target=worker, daemon=True).start()
+
+    def _install_downloaded_update(self, installer: Path) -> None:
+        if self.service.focus is not None:
+            self._show_update_result("任务仍在进行，已取消本次安装")
+            return
+        launch_installer(installer)
+        self.quit_requested.emit()
+
+    def _show_update_result(self, message: str) -> None:
+        self.last_message = message
+        if self.tray is not None and not Preferences.load(self.service.storage).is_quiet_now():
+            self.tray.showMessage("WaitLAB 更新", message, QSystemTrayIcon.MessageIcon.Information, 4500)
         self.refresh()
 
     def save_position(self) -> None:
@@ -1226,8 +1372,9 @@ class PetWindow(QWidget):
             geometry = screen.availableGeometry()
             preferred_y = saved_point.y() if saved_point is not None else geometry.top() + 180
             maximum_y = max(geometry.top() + 10, geometry.bottom() - self.height() - 10)
-            y = min(max(preferred_y, geometry.top() + 10), maximum_y)
-            self.move(geometry.left() + 10, y)
+            preferred_x = saved_point.x() if saved_point is not None else geometry.left() + 10
+            maximum_x = max(geometry.left() + 10, geometry.right() - self.width() - 10)
+            self.move(min(max(preferred_x, geometry.left() + 10), maximum_x), min(max(preferred_y, geometry.top() + 10), maximum_y))
 
     def _begin_pet_drag(self, global_position: QPoint) -> None:
         self._drag_origin = global_position - self.frameGeometry().topLeft()
@@ -1238,17 +1385,30 @@ class PetWindow(QWidget):
 
     def _finish_pet_drag(self) -> None:
         self._drag_origin = None
-        self._snap_to_left_edge()
+        self._snap_to_near_edge()
         self.save_position()
 
-    def _snap_to_left_edge(self) -> None:
+    def _snap_to_near_edge(self) -> None:
         screen = QApplication.screenAt(self.frameGeometry().center()) or QApplication.primaryScreen()
         if screen is None:
             return
         geometry = screen.availableGeometry()
-        maximum_y = max(geometry.top() + 10, geometry.bottom() - self.height() - 10)
-        y = min(max(self.y(), geometry.top() + 10), maximum_y)
-        self.move(geometry.left() + 10, y)
+        self._keep_on_screen()
+        threshold = 28
+        x = self.x()
+        if abs(x - geometry.left()) <= threshold:
+            self.move(geometry.left() + 10, self.y())
+        elif abs((x + self.width()) - geometry.right()) <= threshold:
+            self.move(geometry.right() - self.width() - 10, self.y())
+
+    def _keep_on_screen(self) -> None:
+        screen = QApplication.screenAt(self.frameGeometry().center()) or QApplication.primaryScreen()
+        if screen is None:
+            return
+        geometry = screen.availableGeometry()
+        x = min(max(self.x(), geometry.left() + 10), max(geometry.left() + 10, geometry.right() - self.width() - 10))
+        y = min(max(self.y(), geometry.top() + 10), max(geometry.top() + 10, geometry.bottom() - self.height() - 10))
+        self.move(x, y)
 
     def enterEvent(self, event) -> None:  # noqa: N802
         if self.presentation_mode is PresentationMode.ICON:
@@ -1277,7 +1437,7 @@ class PetWindow(QWidget):
     def mouseReleaseEvent(self, event: QMouseEvent) -> None:  # noqa: N802
         if self._drag_origin is not None:
             self._drag_origin = None
-            self._snap_to_left_edge()
+            self._snap_to_near_edge()
             self.save_position()
         super().mouseReleaseEvent(event)
 
