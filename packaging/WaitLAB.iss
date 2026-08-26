@@ -1,5 +1,5 @@
 #define MyAppName "WaitLAB"
-#define MyAppVersion "0.5.3"
+#define MyAppVersion "0.5.4"
 #define MyAppPublisher "WaitLAB"
 #define MyAppExeName "WaitLAB.exe"
 
