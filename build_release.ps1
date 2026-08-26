@@ -50,9 +50,10 @@ try {
         $HashTargets += $Installer
     }
     $Hashes = Get-FileHash $HashTargets -Algorithm SHA256
-    $HashLines = $Hashes | ForEach-Object { '{0} *{1}' -f $_.Hash, $_.Name }
+    $HashLines = $Hashes | ForEach-Object { '{0} *{1}' -f $_.Hash, (Split-Path -Leaf $_.Path) }
     Set-Content -LiteralPath (Join-Path $ReleaseDir 'SHA256SUMS.txt') -Value $HashLines -Encoding ascii
     $Hashes
 } finally {
     Pop-Location
 }
+
