@@ -568,6 +568,7 @@ class PetWindow(QWidget):
         self._desktop_source_path: Path | None = None
         self._ai_attention = False
         self.presentation_mode: PresentationMode | None = None
+        self._focus_full_title = ""
 
         self.setWindowTitle("WaitLAB")
         self.setWindowIcon(app_icon())
@@ -989,15 +990,16 @@ class PetWindow(QWidget):
             self.ai_card.style().polish(self.ai_card)
 
         if focus is not None:
-            elided_title = self.focus_title.fontMetrics().elidedText(
-                focus.task.title,
-                Qt.TextElideMode.ElideRight,
-                self.focus_title.width(),
-            )
-            self.focus_title.setText(elided_title)
+            self._focus_full_title = focus.task.title
+            self.focus_title.setText(self._focus_full_title)
             self.focus_title.setToolTip(focus.task.title)
             self.focus_time.setText(format_duration(focus.elapsed_seconds()))
             self.pause_button.setText("▶\n继续" if focus.is_paused else "Ⅱ\n暂停")
+
+        else:
+            self._focus_full_title = ""
+            self.focus_title.clear()
+            self.focus_title.setToolTip("")
 
         picker_visible = self.task_picker_open and focus is None
         if picker_visible:
@@ -1006,6 +1008,9 @@ class PetWindow(QWidget):
         self._set_presentation_mode(
             choose_presentation_mode(focus is not None, picker_visible)
         )
+        if focus is not None:
+            self._elide_focus_title()
+            QTimer.singleShot(0, self._elide_focus_title)
 
         minutes = int(self.service.storage.today_focus_seconds() // 60)
         self.today_label.setText(f"今日回收 {minutes} 分钟")
@@ -1018,6 +1023,20 @@ class PetWindow(QWidget):
         self.card.layout().invalidate()
         self.card.layout().activate()
         self.setFixedHeight(self.card.sizeHint().height() + 16)
+
+    def _elide_focus_title(self) -> None:
+        if not self._focus_full_title:
+            return
+        width = self.focus_title.contentsRect().width()
+        if width <= 0:
+            return
+        self.focus_title.setText(
+            self.focus_title.fontMetrics().elidedText(
+                self._focus_full_title,
+                Qt.TextElideMode.ElideRight,
+                width,
+            )
+        )
 
     def _set_presentation_mode(self, mode: PresentationMode) -> None:
         if self.presentation_mode is mode:
