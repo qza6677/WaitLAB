@@ -5,6 +5,11 @@ on:
     tags:
       - "v*"
   workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release version, for example v0.4.0"
+        required: true
+        type: string
 
 permissions:
   contents: write
@@ -42,10 +47,17 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          $tag = "${{ github.ref_name }}"
+          $tag = "${{ inputs.tag }}"
+          if (-not $tag) {
+            $tag = "${{ github.ref_name }}"
+          }
+          if ($tag -notmatch '^v\d+\.\d+\.\d+$') {
+            throw "Release tag must use vMAJOR.MINOR.PATCH, for example v0.4.0."
+          }
           gh release create $tag `
             .\release\WaitLAB-Setup-*.exe `
             .\release\WaitLAB.exe `
             .\release\SHA256SUMS.txt `
             --title "WaitLAB $tag" `
             --generate-notes
+
