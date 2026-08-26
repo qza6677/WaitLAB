@@ -12,3 +12,8 @@ def test_open_picker_uses_picker_mode_without_focus():
 def test_focus_always_uses_player_mode():
     assert choose_presentation_mode(True, False) is PresentationMode.PLAYER
     assert choose_presentation_mode(True, True) is PresentationMode.PLAYER
+
+
+def test_hidden_page_always_collapses_to_cookie_icon():
+    assert choose_presentation_mode(True, False, page_hidden=True) is PresentationMode.ICON
+    assert choose_presentation_mode(False, True, page_hidden=True) is PresentationMode.ICON

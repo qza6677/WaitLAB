@@ -1,0 +1,369 @@
+{
+  "source": "D:\\CodexTest\\WaitLAB\\resources\\Cookie\\ChatGPT Image 2026年8月26日 23_11_30.png",
+  "source_size": [
+    1536,
+    1024
+  ],
+  "grid": {
+    "columns": 4,
+    "rows": 3
+  },
+  "alpha_threshold": 8,
+  "canvas_size": 256,
+  "app_size": 96,
+  "target_cat_height": 220,
+  "target_cat_center": [
+    128,
+    232
+  ],
+  "states": [
+    {
+      "index": 1,
+      "name": "idle",
+      "row": 1,
+      "column": 1,
+      "source_bbox": [
+        0,
+        0,
+        384,
+        348
+      ],
+      "cat_bbox_in_cell": [
+        68,
+        16,
+        348,
+        348
+      ],
+      "anchor": {
+        "scale": 0.6626506024096386,
+        "cat_center_x": 128.0,
+        "cat_baseline_y": 232.0,
+        "content_bbox": [
+          35.22891566265059,
+          11.999999999999982,
+          220.7710843373494,
+          232.0
+        ]
+      }
+    },
+    {
+      "index": 2,
+      "name": "waiting",
+      "row": 1,
+      "column": 2,
+      "source_bbox": [
+        384,
+        0,
+        768,
+        348
+      ],
+      "cat_bbox_in_cell": [
+        28,
+        2,
+        327,
+        348
+      ],
+      "anchor": {
+        "scale": 0.6358381502890174,
+        "cat_center_x": 128.0,
+        "cat_baseline_y": 232.0,
+        "content_bbox": [
+          32.94219653179191,
+          11.999999999999998,
+          223.05780346820808,
+          232.0
+        ]
+      }
+    },
+    {
+      "index": 3,
+      "name": "working",
+      "row": 1,
+      "column": 3,
+      "source_bbox": [
+        768,
+        0,
+        1152,
+        348
+      ],
+      "cat_bbox_in_cell": [
+        24,
+        67,
+        333,
+        339
+      ],
+      "anchor": {
+        "scale": 0.7766990291262136,
+        "cat_center_x": 128.0,
+        "cat_baseline_y": 232.0,
+        "content_bbox": [
+          8.000000000000007,
+          20.737864077669897,
+          248.0,
+          232.0
+        ]
+      }
+    },
+    {
+      "index": 4,
+      "name": "paused",
+      "row": 1,
+      "column": 4,
+      "source_bbox": [
+        1152,
+        0,
+        1536,
+        348
+      ],
+      "cat_bbox_in_cell": [
+        14,
+        121,
+        336,
+        340
+      ],
+      "anchor": {
+        "scale": 0.7407407407407407,
+        "cat_center_x": 128.0,
+        "cat_baseline_y": 232.0,
+        "content_bbox": [
+          8.740740740740751,
+          49.77777777777777,
+          248.0,
+          232.0
+        ]
+      }
+    },
+    {
+      "index": 5,
+      "name": "attention",
+      "row": 2,
+      "column": 1,
+      "source_bbox": [
+        0,
+        348,
+        384,
+        665
+      ],
+      "cat_bbox_in_cell": [
+        29,
+        0,
+        349,
+        317
+      ],
+      "anchor": {
+        "scale": 0.694006309148265,
+        "cat_center_x": 128.0,
+        "cat_baseline_y": 232.0,
+        "content_bbox": [
+          16.95899053627759,
+          12.0,
+          239.0410094637224,
+          232.0
+        ]
+      }
+    },
+    {
+      "index": 6,
+      "name": "ai-complete",
+      "row": 2,
+      "column": 2,
+      "source_bbox": [
+        384,
+        348,
+        768,
+        665
+      ],
+      "cat_bbox_in_cell": [
+        25,
+        1,
+        327,
+        317
+      ],
+      "anchor": {
+        "scale": 0.6962025316455697,
+        "cat_center_x": 128.0,
+        "cat_baseline_y": 232.0,
+        "content_bbox": [
+          22.873417721518976,
+          11.999999999999988,
+          233.126582278481,
+          232.0
+        ]
+      }
+    },
+    {
+      "index": 7,
+      "name": "error",
+      "row": 2,
+      "column": 3,
+      "source_bbox": [
+        768,
+        348,
+        1152,
+        665
+      ],
+      "cat_bbox_in_cell": [
+        35,
+        6,
+        336,
+        316
+      ],
+      "anchor": {
+        "scale": 0.6201550387596899,
+        "cat_center_x": 128.0,
+        "cat_baseline_y": 232.0,
+        "content_bbox": [
+          34.66666666666666,
+          39.75193798449612,
+          248.0,
+          232.0
+        ]
+      }
+    },
+    {
+      "index": 8,
+      "name": "task-complete",
+      "row": 2,
+      "column": 4,
+      "source_bbox": [
+        1152,
+        348,
+        1536,
+        665
+      ],
+      "cat_bbox_in_cell": [
+        0,
+        1,
+        360,
+        317
+      ],
+      "anchor": {
+        "scale": 0.6666666666666666,
+        "cat_center_x": 128.0,
+        "cat_baseline_y": 232.0,
+        "content_bbox": [
+          8.0,
+          21.333333333333353,
+          248.0,
+          232.0
+        ]
+      }
+    },
+    {
+      "index": 9,
+      "name": "curious",
+      "row": 3,
+      "column": 1,
+      "source_bbox": [
+        0,
+        665,
+        384,
+        1024
+      ],
+      "cat_bbox_in_cell": [
+        82,
+        0,
+        362,
+        328
+      ],
+      "anchor": {
+        "scale": 0.6707317073170732,
+        "cat_center_x": 128.0,
+        "cat_baseline_y": 232.0,
+        "content_bbox": [
+          34.09756097560975,
+          12.0,
+          221.90243902439025,
+          232.0
+        ]
+      }
+    },
+    {
+      "index": 10,
+      "name": "offline",
+      "row": 3,
+      "column": 2,
+      "source_bbox": [
+        384,
+        665,
+        768,
+        1024
+      ],
+      "cat_bbox_in_cell": [
+        69,
+        0,
+        354,
+        328
+      ],
+      "anchor": {
+        "scale": 0.6707317073170732,
+        "cat_center_x": 128.0,
+        "cat_baseline_y": 232.0,
+        "content_bbox": [
+          32.42073170731706,
+          12.0,
+          230.95731707317074,
+          232.0
+        ]
+      }
+    },
+    {
+      "index": 11,
+      "name": "update-available",
+      "row": 3,
+      "column": 3,
+      "source_bbox": [
+        768,
+        665,
+        1152,
+        1024
+      ],
+      "cat_bbox_in_cell": [
+        28,
+        3,
+        384,
+        328
+      ],
+      "anchor": {
+        "scale": 0.6741573033707865,
+        "cat_center_x": 128.0,
+        "cat_baseline_y": 232.0,
+        "content_bbox": [
+          7.999999999999993,
+          12.89887640449439,
+          248.0,
+          232.0
+        ]
+      }
+    },
+    {
+      "index": 12,
+      "name": "updating",
+      "row": 3,
+      "column": 4,
+      "source_bbox": [
+        1152,
+        665,
+        1536,
+        1024
+      ],
+      "cat_bbox_in_cell": [
+        45,
+        1,
+        337,
+        328
+      ],
+      "anchor": {
+        "scale": 0.672782874617737,
+        "cat_center_x": 128.0,
+        "cat_baseline_y": 232.0,
+        "content_bbox": [
+          29.77370030581039,
+          12.000000000000012,
+          226.2262996941896,
+          232.0
+        ]
+      }
+    }
+  ]
+}

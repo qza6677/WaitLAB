@@ -1,13 +1,23 @@
 from __future__ import annotations
 
 import math
+import random
 import time
 from threading import Thread
 from datetime import datetime
 from enum import StrEnum
 from pathlib import Path
 
-from PySide6.QtCore import QPoint, QRectF, Qt, QTime, QTimer, Signal
+from PySide6.QtCore import (
+    QEasingCurve,
+    QPoint,
+    QRectF,
+    Qt,
+    QTime,
+    QTimer,
+    QVariantAnimation,
+    Signal,
+)
 from PySide6.QtGui import QColor, QFont, QIcon, QKeyEvent, QMouseEvent, QPainter, QPainterPath, QPen, QPixmap
 from PySide6.QtWidgets import (
     QAbstractItemView,
@@ -35,6 +45,14 @@ from PySide6.QtWidgets import (
 
 from .autostart import is_autostart_enabled, set_autostart
 from .connection import HookConnectionInfo, HookConnectionMonitor, HookConnectionState
+from .cookie import (
+    COOKIE_STATE_LABELS,
+    CookieAssets,
+    CookieContext,
+    CookieState,
+    CookieStateMachine,
+    coerce_cookie_state,
+)
 from .desktop_activity import DesktopActivityEvent, DesktopEventKind
 from .models import DefaultTaskEntry, ServiceUpdate, Task, TaskKind, utc_now
 from .preferences import PopupMode, Preferences
@@ -42,6 +60,7 @@ from .service import WaitLabService
 from .storage import DEFAULT_TASKS
 from . import __version__
 from .updates import ReleaseInfo, download_verified_installer, fetch_latest_release, launch_installer
+from .windowing import apply_native_topmost
 
 
 COLORS = {
@@ -94,15 +113,57 @@ class PetFace(QWidget):
         super().__init__(parent)
         self.setFixedSize(size, size)
         self.mode = "idle"
+        self.cookie_state = CookieState.IDLE
+        self.assets = CookieAssets()
+        self._cookie_pixmap = QPixmap()
+        self._previous_cookie_pixmap = QPixmap()
+        self._transition_progress = 1.0
         self.phase = 0.0
         self._press_position: QPoint | None = None
         self._dragging = False
         self._timer = QTimer(self)
         self._timer.timeout.connect(self._animate)
         self._timer.start(90)
+        self._transition = QVariantAnimation(self)
+        self._transition.setDuration(180)
+        self._transition.setEasingCurve(QEasingCurve.Type.InOutCubic)
+        self._transition.valueChanged.connect(self._on_transition_value)
+        self._transition.finished.connect(self._finish_transition)
+        self.set_state(CookieState.IDLE)
 
     def set_mode(self, mode: str) -> None:
-        self.mode = mode
+        self.set_state(coerce_cookie_state(mode))
+
+    def set_state(self, state: CookieState | str) -> None:
+        next_state = coerce_cookie_state(state)
+        if next_state is self.cookie_state and not self._cookie_pixmap.isNull():
+            return
+        previous_pixmap = self._cookie_pixmap
+        self.cookie_state = next_state
+        self.mode = self.cookie_state.value
+        path = self.assets.path_for(self.cookie_state)
+        next_pixmap = QPixmap(str(path)) if path is not None else QPixmap()
+        self._transition.stop()
+        if not previous_pixmap.isNull() and not next_pixmap.isNull():
+            self._previous_cookie_pixmap = previous_pixmap
+            self._transition_progress = 0.0
+            self._cookie_pixmap = next_pixmap
+            self._transition.setStartValue(0.0)
+            self._transition.setEndValue(1.0)
+            self._transition.start()
+        else:
+            self._previous_cookie_pixmap = QPixmap()
+            self._transition_progress = 1.0
+            self._cookie_pixmap = next_pixmap
+        self.update()
+
+    def _on_transition_value(self, value) -> None:
+        self._transition_progress = float(value)
+        self.update()
+
+    def _finish_transition(self) -> None:
+        self._previous_cookie_pixmap = QPixmap()
+        self._transition_progress = 1.0
         self.update()
 
     def _animate(self) -> None:
@@ -146,20 +207,43 @@ class PetFace(QWidget):
 
     def paintEvent(self, _event) -> None:  # noqa: N802
         painter = QPainter(self)
+        if not self._cookie_pixmap.isNull():
+            painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, True)
+            bob = math.sin(self.phase) * 1.0 if self.cookie_state in {
+                CookieState.WAITING,
+                CookieState.ATTENTION,
+                CookieState.ERROR,
+            } else 0.0
+            if not self._previous_cookie_pixmap.isNull() and self._transition_progress < 1.0:
+                self._draw_cookie_pixmap(
+                    painter,
+                    self._previous_cookie_pixmap,
+                    1.0 - self._transition_progress,
+                    bob,
+                )
+            self._draw_cookie_pixmap(painter, self._cookie_pixmap, self._transition_progress, bob)
+            painter.end()
+            return
+
+        # Keep a small vector fallback so a missing asset never makes the
+        # desktop pet disappear (for example during a development checkout).
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
         scale = min(self.width(), self.height()) / 74.0
         painter.scale(scale, scale)
-        bob = math.sin(self.phase) * 2 if self.mode in {"waiting", "attention", "blocked"} else 0
+        bob = math.sin(self.phase) * 2 if self.mode in {"waiting", "attention", "blocked", "error"} else 0
         painter.translate(0, bob)
 
         accent = {
             "idle": QColor(COLORS["mint"]),
             "waiting": QColor(COLORS["yellow"]),
             "focus": QColor(COLORS["mint"]),
+            "working": QColor(COLORS["mint"]),
             "done": QColor(COLORS["peach"]),
+            "ai-complete": QColor(COLORS["peach"]),
             "paused": QColor("#B7A6D9"),
             "attention": QColor(COLORS["peach"]),
             "blocked": QColor("#D97862"),
+            "error": QColor("#D97862"),
         }.get(self.mode, QColor(COLORS["mint"]))
 
         painter.setPen(Qt.PenStyle.NoPen)
@@ -182,14 +266,30 @@ class PetFace(QWidget):
         painter.setBrush(QColor(COLORS["cream"]))
         painter.drawEllipse(QRectF(13, 19, 48, 43))
         painter.setBrush(QColor(COLORS["ink"]))
-        eye_height = 2 if self.mode == "done" else 6
+        eye_height = 2 if self.mode in {"done", "ai-complete"} else 6
         painter.drawRoundedRect(QRectF(27, 35, 4, eye_height), 2, 2)
         painter.drawRoundedRect(QRectF(44, 35, 4, eye_height), 2, 2)
         painter.setPen(QPen(QColor(COLORS["ink"]), 2))
-        if self.mode == "done":
+        if self.mode in {"done", "ai-complete"}:
             painter.drawArc(QRectF(32, 38, 12, 10), 200 * 16, 140 * 16)
         else:
             painter.drawArc(QRectF(34, 42, 8, 5), 200 * 16, 140 * 16)
+
+    def _draw_cookie_pixmap(
+        self,
+        painter: QPainter,
+        pixmap: QPixmap,
+        opacity: float,
+        bob: float,
+    ) -> None:
+        if opacity <= 0.0:
+            return
+        target = self.rect().adjusted(1, 1, -1, -1)
+        target.translate(0, round(bob))
+        painter.save()
+        painter.setOpacity(opacity)
+        painter.drawPixmap(target, pixmap)
+        painter.restore()
 
 
 class PresentationMode(StrEnum):
@@ -198,7 +298,13 @@ class PresentationMode(StrEnum):
     PLAYER = "player"
 
 
-def choose_presentation_mode(has_focus: bool, picker_open: bool) -> PresentationMode:
+def choose_presentation_mode(
+    has_focus: bool,
+    picker_open: bool,
+    page_hidden: bool = False,
+) -> PresentationMode:
+    if page_hidden:
+        return PresentationMode.ICON
     if has_focus:
         return PresentationMode.PLAYER
     if picker_open:
@@ -543,6 +649,63 @@ class SettingsDialog(QDialog):
         self.settings_changed.emit()
         self.accept()
 
+
+class CookiePreviewDialog(QDialog):
+    """Small development-facing page for checking every Cookie state asset."""
+
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("Cookie 表情预览")
+        self.setMinimumSize(360, 390)
+        self.setWindowIcon(app_icon())
+        self.setStyleSheet(_dialog_stylesheet())
+
+        self.assets = CookieAssets()
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(24, 22, 24, 22)
+        layout.setSpacing(12)
+
+        title = QLabel("Cookie 表情预览")
+        title.setObjectName("dialogTitle")
+        subtitle = QLabel("用于确认 12 个状态图片已正确加载；不会影响当前计时任务。")
+        subtitle.setObjectName("muted")
+        subtitle.setWordWrap(True)
+        layout.addWidget(title)
+        layout.addWidget(subtitle)
+
+        self.preview = PetFace(220, self)
+        self.preview.assets = self.assets
+        layout.addWidget(self.preview, 0, Qt.AlignmentFlag.AlignHCenter)
+
+        self.state_selector = QComboBox()
+        for state in CookieState:
+            self.state_selector.addItem(COOKIE_STATE_LABELS[state], state.value)
+        self.state_selector.currentIndexChanged.connect(self._state_changed)
+        layout.addWidget(self.state_selector)
+
+        self.asset_status = QLabel()
+        self.asset_status.setObjectName("muted")
+        self.asset_status.setWordWrap(True)
+        layout.addWidget(self.asset_status)
+
+        close_button = QPushButton("关闭")
+        close_button.clicked.connect(self.reject)
+        layout.addWidget(close_button, 0, Qt.AlignmentFlag.AlignRight)
+        self._state_changed(0)
+
+    def _state_changed(self, index: int) -> None:
+        value = self.state_selector.itemData(index)
+        if not isinstance(value, str):
+            return
+        state = coerce_cookie_state(value)
+        self.preview.set_state(state)
+        path = self.assets.path_for(state)
+        if path is None:
+            self.asset_status.setText("未找到素材，当前使用矢量兜底图。")
+        else:
+            self.asset_status.setText(f"{state.value} · {path}")
+
+
 class PetWindow(QWidget):
     quit_requested = Signal()
     update_check_finished = Signal(str)
@@ -555,9 +718,15 @@ class PetWindow(QWidget):
         self.tray: QSystemTrayIcon | None = None
         self.task_dialog: TaskManagerDialog | None = None
         self.settings_dialog: SettingsDialog | None = None
+        self.cookie_preview_dialog: CookiePreviewDialog | None = None
         self.task_picker_open = False
+        self.page_hidden = False
+        self.pet_hidden = False
+        self._native_topmost_enabled = True
+        self._next_native_topmost_sync = 0.0
         self._suggestion_signature: tuple[tuple[int | None, str, str], ...] | None = None
         self.completion_banner_until = 0.0
+        self.task_completion_banner_until = 0.0
         self.last_message = "等待下一次 Codex 指令"
         self._drag_origin: QPoint | None = None
         self.hook_monitor = HookConnectionMonitor(service.storage)
@@ -568,6 +737,7 @@ class PetWindow(QWidget):
         self._desktop_source_path: Path | None = None
         self._ai_attention = False
         self.presentation_mode: PresentationMode | None = None
+        self.cookie_state_machine = CookieStateMachine()
         self._focus_full_title = ""
 
         self.setWindowTitle("WaitLAB")
@@ -632,17 +802,26 @@ class PetWindow(QWidget):
         title_row.addWidget(self.state_label, 1)
         tasks_button = QPushButton("任务")
         tasks_button.setObjectName("ghostButton")
+        tasks_button.setToolTip("管理手动任务和固定循环任务")
         tasks_button.clicked.connect(self.open_task_manager)
         settings_button = QPushButton("设置")
         settings_button.setObjectName("ghostButton")
+        settings_button.setToolTip("调整提醒、置顶、静默时段和日用任务")
         settings_button.clicked.connect(self.open_settings)
         hide_button = QPushButton("—")
         hide_button.setObjectName("iconButton")
         hide_button.setFixedWidth(28)
-        hide_button.clicked.connect(self.hide)
+        hide_button.setToolTip("隐藏页面，仅保留 Cookie")
+        hide_button.clicked.connect(self.hide_page)
         title_row.addWidget(tasks_button)
         title_row.addWidget(settings_button)
         title_row.addWidget(hide_button)
+        pet_hide_button = QPushButton("×")
+        pet_hide_button.setObjectName("iconButton")
+        pet_hide_button.setFixedWidth(28)
+        pet_hide_button.setToolTip("隐藏桌宠到系统托盘")
+        pet_hide_button.clicked.connect(self.hide_pet)
+        title_row.addWidget(pet_hide_button)
         titles.addLayout(title_row)
         self.message_label = QLabel(self.last_message)
         self.message_label.setObjectName("muted")
@@ -658,6 +837,11 @@ class PetWindow(QWidget):
         self.focus_card = QFrame()
         self.focus_card.setObjectName("focusCard")
         self.focus_card.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        focus_shadow = QGraphicsDropShadowEffect(self.focus_card)
+        focus_shadow.setBlurRadius(18)
+        focus_shadow.setOffset(0, 4)
+        focus_shadow.setColor(QColor(40, 55, 50, 35))
+        self.focus_card.setGraphicsEffect(focus_shadow)
         focus_layout = QVBoxLayout(self.focus_card)
         focus_layout.setContentsMargins(11, 9, 11, 9)
         focus_layout.setSpacing(6)
@@ -670,14 +854,21 @@ class PetWindow(QWidget):
             QSizePolicy.Policy.Expanding,
             QSizePolicy.Policy.Fixed,
         )
-        self.focus_title.setMinimumWidth(100)
+        self.focus_title.setMinimumWidth(0)
         self.focus_title.setMinimumHeight(22)
         self.focus_title.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
         self.focus_time = QLabel("00:00")
         self.focus_time.setObjectName("timerCompact")
+        self.focus_time.setMinimumWidth(58)
         self.focus_time.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
         focus_info.addWidget(self.focus_title, 1)
         focus_info.addWidget(self.focus_time, 0)
+        self.focus_hide_button = QPushButton("—")
+        self.focus_hide_button.setObjectName("iconButton")
+        self.focus_hide_button.setFixedSize(24, 24)
+        self.focus_hide_button.setToolTip("隐藏页面，仅保留 Cookie")
+        self.focus_hide_button.clicked.connect(self.hide_page)
+        focus_info.addWidget(self.focus_hide_button, 0)
         focus_layout.addLayout(focus_info)
 
         controls = QHBoxLayout()
@@ -697,7 +888,7 @@ class PetWindow(QWidget):
         abandon_button.clicked.connect(self.abandon_focus)
         for button in (self.pause_button, complete_button, abandon_button):
             button.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
-            button.setMinimumHeight(40)
+            button.setMinimumHeight(36)
         controls.addWidget(self.pause_button)
         controls.addWidget(complete_button)
         controls.addWidget(abandon_button)
@@ -744,6 +935,11 @@ class PetWindow(QWidget):
         add_row.addWidget(self.quick_task_input, 1)
         add_row.addWidget(add_quick)
         picker_layout.addLayout(add_row)
+        self.random_task_button = QPushButton("随机开始一个固定任务")
+        self.random_task_button.setObjectName("secondaryButton")
+        self.random_task_button.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.random_task_button.clicked.connect(self._start_random_task)
+        picker_layout.addWidget(self.random_task_button)
         self.suggestion_container = QWidget()
         self.suggestion_container.setSizePolicy(
             QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Maximum
@@ -865,14 +1061,18 @@ class PetWindow(QWidget):
             self.last_message = update.message
         if update.show_task_picker:
             preferences = Preferences.load(self.service.storage)
+            if preferences.popup_mode is not PopupMode.TRAY_ONLY:
+                self.page_hidden = False
             self.task_picker_open = preferences.popup_mode is not PopupMode.TRAY_ONLY
             if self.task_picker_open:
                 self._set_presentation_mode(PresentationMode.PICKER)
             if preferences.popup_mode is PopupMode.RAISE:
+                self.pet_hidden = False
                 self.show()
                 self.raise_()
                 self.activateWindow()
             elif preferences.popup_mode is PopupMode.QUIET:
+                self.pet_hidden = False
                 self.show()
             elif self.tray is not None:
                 self.tray.showMessage(
@@ -927,39 +1127,39 @@ class PetWindow(QWidget):
         focus = self.service.focus
         open_ai = self.service.storage.get_open_ai()
         completed_visible = time.monotonic() < self.completion_banner_until
+        task_completed_visible = time.monotonic() < self.task_completion_banner_until
         terminal_blocked = (
             completed_visible
             and self.service.last_ai_terminal_status not in {None, "completed"}
         )
         needs_attention = open_ai is not None and open_ai.status == "needs_attention"
 
+        cookie_state = self.cookie_state_machine.transition(
+            CookieContext(
+                focus_active=focus is not None,
+                focus_paused=focus is not None and focus.is_paused,
+                ai_active=open_ai is not None,
+                ai_needs_attention=needs_attention,
+                completion_visible=completed_visible,
+                task_completion_visible=task_completed_visible,
+                terminal_error=terminal_blocked,
+            )
+        )
+
         if needs_attention:
-            mode = "attention"
             state = "Codex 等待批准"
         elif focus is not None:
-            mode = (
-                "blocked"
-                if terminal_blocked
-                else "done"
-                if completed_visible
-                else "waiting"
-                if open_ai is not None
-                else "paused"
-                if focus.is_paused
-                else "focus"
-            )
             state = "微任务已暂停" if focus.is_paused else "正在回收等待时间"
         elif open_ai is not None:
-            mode = "waiting"
             state = "Codex 正在工作"
+        elif task_completed_visible:
+            state = "微任务已完成"
         elif completed_visible:
-            mode = "blocked" if terminal_blocked else "done"
             state = "Codex 已中断" if terminal_blocked else "Codex 已完成"
         else:
-            mode = "idle"
             state = "等待下一轮"
 
-        self.pet.set_mode(mode)
+        self.pet.set_state(cookie_state)
         self.state_label.setText(state)
         self.message_label.setText(self.last_message)
 
@@ -1001,12 +1201,24 @@ class PetWindow(QWidget):
             self.focus_title.clear()
             self.focus_title.setToolTip("")
 
-        picker_visible = self.task_picker_open and focus is None
+        picker_visible = self.task_picker_open and focus is None and not self.page_hidden
         if picker_visible:
             self._refresh_suggestions()
 
         self._set_presentation_mode(
-            choose_presentation_mode(focus is not None, picker_visible)
+            choose_presentation_mode(
+                focus is not None,
+                picker_visible,
+                page_hidden=self.page_hidden,
+            )
+        )
+        # Keep the AI lifecycle visible alongside an active micro-task.  The
+        # task timer is independent, so completion/attention feedback never
+        # replaces or stops the focus bubble.
+        self.ai_card.setVisible(
+            self.presentation_mode is not PresentationMode.ICON
+            and not self.page_hidden
+            and (open_ai is not None or completed_visible)
         )
         if focus is not None:
             self._elide_focus_title()
@@ -1018,6 +1230,13 @@ class PetWindow(QWidget):
         self.card.layout().invalidate()
         self.card.layout().activate()
         QTimer.singleShot(0, self._fit_to_content)
+        if (
+            self.isVisible()
+            and self._native_topmost_enabled
+            and time.monotonic() >= self._next_native_topmost_sync
+        ):
+            self._next_native_topmost_sync = time.monotonic() + 1.5
+            self._apply_native_topmost()
 
     def _fit_to_content(self) -> None:
         self.card.layout().invalidate()
@@ -1072,6 +1291,7 @@ class PetWindow(QWidget):
         self.card.style().polish(self.card)
         self.setWindowOpacity(opacity)
         self.setFixedWidth(width)
+        QTimer.singleShot(0, self._apply_native_topmost)
         self.card.layout().invalidate()
         self.card.layout().activate()
         QTimer.singleShot(0, self._fit_to_content)
@@ -1144,9 +1364,19 @@ class PetWindow(QWidget):
 
     def _refresh_suggestions(self) -> None:
         manual = self.service.storage.list_manual_tasks()
-        defaults = [Task(None, entry.title, TaskKind.DEFAULT) for entry in self.service.storage.default_task_entries() if entry.enabled]
-        tasks = manual + defaults[:3]
+        # Manual tasks are always the first-class queue.  The fixed cycle is a
+        # fallback only when that queue is empty, matching the service's
+        # selection semantics and keeping the picker easy to scan.
+        tasks = manual if manual else self.service.suggested_tasks()
         signature = tuple((task.id, task.title, task.kind.value) for task in tasks)
+        completed = self.service.storage.today_completed_titles()
+        self.today_completed_label.setText(
+            "今日已完成：" + "、".join(completed[:5])
+            if completed
+            else "今日还没有完成微任务"
+        )
+        self.random_task_button.setVisible(not manual and bool(tasks))
+        self.picker_source.setText("我的具体任务" if manual else "固定循环任务")
         if signature == self._suggestion_signature:
             return
         self._suggestion_signature = signature
@@ -1155,7 +1385,6 @@ class PetWindow(QWidget):
             widget = item.widget()
             if widget is not None:
                 widget.deleteLater()
-        self.picker_source.setText("我的任务 + 随机任务")
         if not tasks:
             empty = QLabel("暂无可用任务。请添加手动任务，或在设置中启用固定任务。")
             empty.setObjectName("muted")
@@ -1165,13 +1394,10 @@ class PetWindow(QWidget):
             configure.clicked.connect(self.open_settings)
             self.suggestion_layout.addWidget(configure)
             return
-        current_kind = None
+        section = QLabel("我的具体任务" if manual else "固定循环候选")
+        section.setObjectName("muted")
+        self.suggestion_layout.addWidget(section)
         for index, task in enumerate(tasks, start=1):
-            if task.kind is not current_kind:
-                current_kind = task.kind
-                section = QLabel("我的具体任务" if task.kind is TaskKind.MANUAL else "随机循环任务")
-                section.setObjectName("muted")
-                self.suggestion_layout.addWidget(section)
             button = QPushButton(f"{index} · {task.title}")
             button.setObjectName("taskButton")
             button.setCursor(Qt.CursorShape.PointingHandCursor)
@@ -1182,8 +1408,21 @@ class PetWindow(QWidget):
         self.picker.layout().invalidate()
         self.picker.updateGeometry()
         self.card.layout().invalidate()
-        completed = self.service.storage.today_completed_titles()
-        self.today_completed_label.setText("今日已完成：" + "、".join(completed[:5]) if completed else "今日还没有完成微任务")
+
+    def _start_random_task(self) -> None:
+        if self.service.storage.list_manual_tasks():
+            self.last_message = "先完成或删除手动任务，再使用固定循环任务"
+            self.refresh()
+            return
+        tasks = self.service.suggested_tasks()
+        if not tasks:
+            self.last_message = "暂无启用的固定循环任务"
+            self.refresh()
+            return
+        # The service keeps the rotation order; choosing from the visible
+        # candidates adds a lightweight random entry point without changing
+        # persistence or completion semantics.
+        self.start_focus(random.choice(tasks))
 
     def _add_quick_task(self) -> None:
         try:
@@ -1210,7 +1449,7 @@ class PetWindow(QWidget):
 
     def complete_focus(self) -> None:
         self.apply_update(self.service.complete_focus())
-        self.completion_banner_until = time.monotonic() + 2.5
+        self.task_completion_banner_until = time.monotonic() + 2.5
         self.task_picker_open = True
         QApplication.beep()
         self._suggestion_signature = None
@@ -1273,11 +1512,21 @@ class PetWindow(QWidget):
         tasks_action.triggered.connect(self.open_task_manager)
         settings_action = menu.addAction("设置")
         settings_action.triggered.connect(self.open_settings)
+        cookie_action = menu.addAction("Cookie 表情预览")
+        cookie_action.triggered.connect(self.open_cookie_preview)
         update_action = menu.addAction("检查更新")
         update_action.triggered.connect(self.check_for_updates)
         menu.addSeparator()
         hide_action = menu.addAction("隐藏到托盘")
-        hide_action.triggered.connect(self.hide)
+        hide_action.triggered.connect(self.hide_pet)
+        topmost_action = menu.addAction(
+            "取消始终置顶" if self._native_topmost_enabled else "始终置顶"
+        )
+        topmost_action.triggered.connect(self.toggle_always_on_top)
+        page_action = menu.addAction(
+            "显示任务页面" if self.page_hidden else "隐藏页面（仅保留 Cookie）"
+        )
+        page_action.triggered.connect(self.show_page if self.page_hidden else self.hide_page)
         quit_action = menu.addAction("退出 WaitLAB")
         quit_action.triggered.connect(self.quit_requested)
         menu.exec(global_position)
@@ -1308,6 +1557,13 @@ class PetWindow(QWidget):
         self.settings_dialog.show()
         self.settings_dialog.raise_()
         self.settings_dialog.activateWindow()
+
+    def open_cookie_preview(self) -> None:
+        if self.cookie_preview_dialog is None:
+            self.cookie_preview_dialog = CookiePreviewDialog(self)
+        self.cookie_preview_dialog.show()
+        self.cookie_preview_dialog.raise_()
+        self.cookie_preview_dialog.activateWindow()
 
     def show_recovery_prompt(self) -> None:
         focus = self.service.focus
@@ -1347,8 +1603,62 @@ class PetWindow(QWidget):
 
     def _apply_window_preferences(self) -> None:
         preferences = Preferences.load(self.service.storage)
+        self._native_topmost_enabled = preferences.always_on_top
         self.setWindowFlag(Qt.WindowType.WindowStaysOnTopHint, preferences.always_on_top)
         self.show()
+        apply_native_topmost(self, preferences.always_on_top)
+        QTimer.singleShot(0, lambda: apply_native_topmost(self, preferences.always_on_top))
+
+    def toggle_always_on_top(self) -> None:
+        enabled = not Preferences.load(self.service.storage).always_on_top
+        self.service.storage.set_setting("always_on_top", "1" if enabled else "0")
+        self._apply_window_preferences()
+        self.refresh()
+
+    def hide_page(self) -> None:
+        """Collapse the page to the Cookie icon without stopping the app."""
+
+        self.page_hidden = True
+        self.task_picker_open = False
+        self.refresh()
+        self.show()
+        self._apply_native_topmost()
+
+    def show_page(self) -> None:
+        """Restore the expanded page while keeping any active focus session."""
+
+        self.page_hidden = False
+        self.pet_hidden = False
+        self.show()
+        self.refresh()
+        self.raise_()
+        self.activateWindow()
+        self._apply_native_topmost()
+
+    def hide_pet(self) -> None:
+        """Hide the whole desktop pet to the tray; timers keep running."""
+
+        self.pet_hidden = True
+        self.hide()
+
+    def restore_from_tray(self, show_page: bool = False) -> None:
+        self.pet_hidden = False
+        if show_page:
+            self.page_hidden = False
+        self.show()
+        self.refresh()
+        self.raise_()
+        self.activateWindow()
+        self._apply_native_topmost()
+
+    def _apply_native_topmost(self) -> None:
+        apply_native_topmost(self, self._native_topmost_enabled)
+
+    def showEvent(self, event) -> None:  # noqa: N802
+        super().showEvent(event)
+        # Windows can reorder a tool window when another app is activated.
+        # Reassert the native z-order after Qt has completed the show event.
+        QTimer.singleShot(0, self._apply_native_topmost)
 
     def check_for_updates(self, silent: bool = False) -> None:
         def worker() -> None:
@@ -1483,7 +1793,9 @@ def create_tray(window: PetWindow) -> QSystemTrayIcon:
     tray.setToolTip("WaitLAB · 把等待变成科研进度")
     menu = QMenu()
     show_action = menu.addAction("显示 WaitLAB")
-    show_action.triggered.connect(window.show)
+    show_action.triggered.connect(window.restore_from_tray)
+    page_action = menu.addAction("显示任务页面")
+    page_action.triggered.connect(lambda: window.restore_from_tray(show_page=True))
     settings_action = menu.addAction("设置")
     settings_action.triggered.connect(window.open_settings)
     menu.addSeparator()
@@ -1498,7 +1810,7 @@ def create_tray(window: PetWindow) -> QSystemTrayIcon:
     quit_action.triggered.connect(window.quit_requested)
     tray.setContextMenu(menu)
     tray.activated.connect(
-        lambda reason: window.show()
+        lambda reason: window.restore_from_tray()
         if reason == QSystemTrayIcon.ActivationReason.Trigger
         else None
     )
@@ -1514,7 +1826,9 @@ def _window_stylesheet() -> str:
         border-radius: 22px;
     }}
     QFrame#mainCard[presentation="icon"] {{
-        border-radius: 30px;
+        background: transparent;
+        border: none;
+        border-radius: 40px;
     }}
     QFrame#mainCard[presentation="player"] {{
         border-radius: 18px;
@@ -1535,7 +1849,9 @@ def _window_stylesheet() -> str:
     }}
     QFrame#aiCard {{ background: #FFF1D1; border-radius: 13px; }}
     QFrame#aiCard[attention="true"] {{ background: #FFE2D2; border: 1px solid {COLORS['peach']}; }}
-    QFrame#focusCard {{ background: {COLORS['white']}; border: 1px solid {COLORS['line']}; border-radius: 15px; }}
+    QFrame#focusCard {{
+        background: {COLORS['white']}; border: 1px solid {COLORS['line']}; border-radius: 16px;
+    }}
     QPushButton {{
         color: {COLORS['ink']}; background: {COLORS['white']};
         border: 1px solid {COLORS['line']}; border-radius: 9px;
@@ -1546,8 +1862,13 @@ def _window_stylesheet() -> str:
         color: white; background: {COLORS['mint_dark']}; border-color: {COLORS['mint_dark']}; font-weight: 650;
     }}
     QPushButton#primaryButton:hover {{ background: #2F6E5D; }}
+    QPushButton#secondaryButton {{
+        color: {COLORS['mint_dark']}; background: #EDF8F3; border-color: #CBE8DA;
+        font-weight: 650; padding: 7px 10px;
+    }}
+    QPushButton#secondaryButton:hover {{ background: #E1F3EA; border-color: {COLORS['mint']}; }}
     QPushButton#playerButton, QPushButton#playerPrimaryButton {{
-        min-width: 0; min-height: 40px; padding: 4px 6px; border-radius: 9px;
+        min-width: 0; min-height: 36px; padding: 3px 5px; border-radius: 9px;
         font-family: 'Microsoft YaHei UI'; font-size: 10px; line-height: 1.0;
     }}
     QPushButton#playerPrimaryButton {{
@@ -1555,7 +1876,7 @@ def _window_stylesheet() -> str:
     }}
     QPushButton#playerCloseButton {{
         background: transparent; border: 1px solid {COLORS['line']}; color: {COLORS['muted']};
-        min-width: 0; min-height: 40px; padding: 4px 6px; border-radius: 9px;
+        min-width: 0; min-height: 36px; padding: 3px 5px; border-radius: 9px;
         font-family: 'Microsoft YaHei UI'; font-size: 10px; line-height: 1.0;
     }}
     QPushButton#playerCloseButton:hover {{ color: #A5533D; background: #FFE9DE; }}
@@ -1570,7 +1891,8 @@ def _window_stylesheet() -> str:
     QPushButton#connectionStatusButton[state="connected"] {{ background: #DDF1E9; color: {COLORS['mint_dark']}; }}
     QPushButton#connectionStatusButton[state="fallback"] {{ background: #FFF1D1; color: #8A6217; }}
     QPushButton#connectionStatusButton[state="degraded"] {{ background: #FFE2D2; color: #9B4F30; }}
-    QPushButton#iconButton {{ background: transparent; border: none; font-size: 15px; }}
+    QPushButton#iconButton {{ background: transparent; border: none; color: {COLORS['muted']}; font-size: 15px; padding: 2px; }}
+    QPushButton#iconButton:hover {{ color: {COLORS['ink']}; background: #F3F0EA; border-radius: 8px; }}
     QPushButton#linkButton {{ background: transparent; border: none; color: {COLORS['muted']}; padding-left: 2px; }}
     """
 
