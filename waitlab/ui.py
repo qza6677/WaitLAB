@@ -657,19 +657,31 @@ class PetWindow(QWidget):
         self.focus_card = QFrame()
         self.focus_card.setObjectName("focusCard")
         self.focus_card.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
-        focus_layout = QHBoxLayout(self.focus_card)
-        focus_layout.setContentsMargins(10, 7, 7, 7)
-        focus_layout.setSpacing(7)
-        focus_info = QVBoxLayout()
-        focus_info.setSpacing(1)
+        focus_layout = QVBoxLayout(self.focus_card)
+        focus_layout.setContentsMargins(11, 9, 11, 9)
+        focus_layout.setSpacing(6)
+        focus_info = QHBoxLayout()
+        focus_info.setContentsMargins(0, 0, 0, 0)
+        focus_info.setSpacing(8)
         self.focus_title = QLabel()
         self.focus_title.setObjectName("focusTitle")
-        self.focus_title.setFixedWidth(112)
+        self.focus_title.setSizePolicy(
+            QSizePolicy.Policy.Expanding,
+            QSizePolicy.Policy.Fixed,
+        )
+        self.focus_title.setMinimumWidth(100)
+        self.focus_title.setMinimumHeight(22)
+        self.focus_title.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
         self.focus_time = QLabel("00:00")
         self.focus_time.setObjectName("timerCompact")
-        focus_info.addWidget(self.focus_title)
-        focus_info.addWidget(self.focus_time)
-        focus_layout.addLayout(focus_info, 1)
+        self.focus_time.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        focus_info.addWidget(self.focus_title, 1)
+        focus_info.addWidget(self.focus_time, 0)
+        focus_layout.addLayout(focus_info)
+
+        controls = QHBoxLayout()
+        controls.setContentsMargins(0, 0, 0, 0)
+        controls.setSpacing(6)
         self.pause_button = QPushButton("Ⅱ\n暂停")
         self.pause_button.setObjectName("playerButton")
         self.pause_button.setToolTip("暂停或继续微任务")
@@ -683,10 +695,12 @@ class PetWindow(QWidget):
         abandon_button.setToolTip("取消本次计时并放回任务池")
         abandon_button.clicked.connect(self.abandon_focus)
         for button in (self.pause_button, complete_button, abandon_button):
-            button.setFixedSize(44, 48)
-        focus_layout.addWidget(self.pause_button)
-        focus_layout.addWidget(complete_button)
-        focus_layout.addWidget(abandon_button)
+            button.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+            button.setMinimumHeight(40)
+        controls.addWidget(self.pause_button)
+        controls.addWidget(complete_button)
+        controls.addWidget(abandon_button)
+        focus_layout.addLayout(controls)
         header.addWidget(self.focus_card, 1)
         layout.addLayout(header)
 
@@ -983,7 +997,7 @@ class PetWindow(QWidget):
             self.focus_title.setText(elided_title)
             self.focus_title.setToolTip(focus.task.title)
             self.focus_time.setText(format_duration(focus.elapsed_seconds()))
-            self.pause_button.setText("继续" if focus.is_paused else "暂停")
+            self.pause_button.setText("▶\n继续" if focus.is_paused else "Ⅱ\n暂停")
 
         picker_visible = self.task_picker_open and focus is None
         if picker_visible:
@@ -1022,7 +1036,10 @@ class PetWindow(QWidget):
             margins = (4, 4, 4, 4)
             opacity = 0.88
         elif mode is PresentationMode.PLAYER:
-            width = 340
+            # The player sits beside the pet inside the same header row.  Its
+            # window width therefore needs to include both the pet and the
+            # task bubble; 340px left the controls squeezing over the title.
+            width = 420
             margins = (7, 6, 7, 6)
             opacity = 0.96
         else:
@@ -1511,13 +1528,16 @@ def _window_stylesheet() -> str:
     }}
     QPushButton#primaryButton:hover {{ background: #2F6E5D; }}
     QPushButton#playerButton, QPushButton#playerPrimaryButton {{
-        min-width: 38px; padding: 6px 7px; border-radius: 9px; font-size: 10px;
+        min-width: 0; min-height: 40px; padding: 4px 6px; border-radius: 9px;
+        font-family: 'Microsoft YaHei UI'; font-size: 10px; line-height: 1.0;
     }}
     QPushButton#playerPrimaryButton {{
         color: white; background: {COLORS['mint_dark']}; border-color: {COLORS['mint_dark']}; font-weight: 650;
     }}
     QPushButton#playerCloseButton {{
-        background: transparent; border: none; color: {COLORS['muted']}; padding: 5px; font-size: 16px;
+        background: transparent; border: 1px solid {COLORS['line']}; color: {COLORS['muted']};
+        min-width: 0; min-height: 40px; padding: 4px 6px; border-radius: 9px;
+        font-family: 'Microsoft YaHei UI'; font-size: 10px; line-height: 1.0;
     }}
     QPushButton#playerCloseButton:hover {{ color: #A5533D; background: #FFE9DE; }}
     QPushButton#taskButton {{
