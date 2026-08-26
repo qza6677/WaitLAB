@@ -28,6 +28,7 @@ def test_bridge_forwards_only_sanitized_lifecycle_data():
             [sys.executable, str(PROJECT_ROOT / "hook_bridge.py"), "--waitlab-hook"],
             input=json.dumps(hook_input, ensure_ascii=False),
             text=True,
+            encoding="utf-8",
             capture_output=True,
             check=True,
             env=environment,
@@ -63,6 +64,7 @@ def test_bridge_forwards_post_tool_use_without_writing_a_hook_decision():
                 }
             ),
             text=True,
+            encoding="utf-8",
             capture_output=True,
             check=True,
             env=environment,
@@ -94,6 +96,7 @@ def test_bridge_permission_request_is_observational_and_silent():
                 }
             ),
             text=True,
+            encoding="utf-8",
             capture_output=True,
             check=True,
             env=environment,
@@ -109,6 +112,7 @@ def test_bridge_ignores_unknown_hook_events():
         [sys.executable, str(PROJECT_ROOT / "hook_bridge.py"), "--waitlab-hook"],
         input=json.dumps({"hook_event_name": "PreToolUse"}),
         text=True,
+        encoding="utf-8",
         capture_output=True,
         check=True,
     )

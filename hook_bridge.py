@@ -38,10 +38,18 @@ def send_event(payload: dict, port: int | None = None) -> None:
         client.sendto(encoded, ("127.0.0.1", target_port))
 
 
+def _read_stdin_utf8() -> str:
+    """Read hook JSON as UTF-8 regardless of the Windows console locale."""
+    stream = getattr(sys.stdin, "buffer", None)
+    if stream is None:
+        return sys.stdin.read()
+    return stream.read().decode("utf-8", errors="replace")
+
+
 def main() -> int:
     event_name = ""
     try:
-        raw_text = sys.stdin.read()
+        raw_text = _read_stdin_utf8()
         raw = json.loads(raw_text) if raw_text.strip() else {}
         payload = sanitized_event(raw)
         if payload is not None:
