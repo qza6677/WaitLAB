@@ -52,6 +52,7 @@ def test_initial_poll_emits_only_currently_running_turns(tmp_path):
     assert [(event.kind, event.turn_id) for event in events] == [
         (DesktopEventKind.STARTED, "turn-live")
     ]
+    assert events[0].initial is True
 
 
 def test_new_turn_transitions_from_running_to_completed_once(tmp_path):
@@ -59,7 +60,6 @@ def test_new_turn_transitions_from_running_to_completed_once(tmp_path):
     create_history(path)
     reader = DesktopActivityReader(path, now=lambda: NOW)
     assert reader.poll() == []
-
     add_turn(path, "thread-1", "turn-1", "inProgress", 1_787_700_000)
     started = reader.poll()
     set_status(path, "turn-1", "completed", 1_787_700_005)
@@ -68,6 +68,49 @@ def test_new_turn_transitions_from_running_to_completed_once(tmp_path):
     assert [event.kind for event in started] == [DesktopEventKind.STARTED]
     assert [event.kind for event in completed] == [DesktopEventKind.COMPLETED]
     assert reader.poll() == []
+    assert reader._known_statuses == {("thread-1", "turn-1"): "completed"}
+
+
+def test_terminal_turns_are_not_kept_in_poll_tracking_cache(tmp_path):
+    path = tmp_path / "thread_history_1.sqlite"
+    create_history(path)
+    reader = DesktopActivityReader(path, now=lambda: NOW, max_rows=32)
+
+    for index in range(80):
+        add_turn(
+            path,
+            f"thread-{index}",
+            f"turn-{index}",
+            "completed",
+            1_787_700_000 + index,
+            1_787_700_001 + index,
+        )
+
+    assert reader.poll() == []
+    assert len(reader._known_statuses) <= 32
+
+
+def test_poll_reads_a_bounded_recent_window_for_large_history(tmp_path):
+    path = tmp_path / "thread_history_1.sqlite"
+    create_history(path)
+    rows = [
+        (
+            f"thread-{index}",
+            f"turn-{index}",
+            "completed",
+            int(NOW.timestamp()) - index,
+            int(NOW.timestamp()) - index + 1,
+            None,
+        )
+        for index in range(2000)
+    ]
+    with sqlite3.connect(path) as connection:
+        connection.executemany("INSERT INTO thread_turns VALUES (?, ?, ?, ?, ?, ?)", rows)
+
+    reader = DesktopActivityReader(path, now=lambda: NOW, max_rows=64)
+    assert reader.poll() == []
+    assert len(reader.status_snapshot()) <= 64
+    assert reader._last_row_id == 2000
 
 
 def test_fast_completed_turn_is_reported_without_replaying_history(tmp_path):
@@ -116,3 +159,29 @@ def test_missing_or_incompatible_database_degrades_without_crashing(tmp_path):
     assert incompatible.poll() == []
     assert incompatible.available is False
     assert "OperationalError" in (incompatible.error or "")
+
+
+def test_status_snapshot_reads_item_timestamp_without_item_contents(tmp_path):
+    path = tmp_path / "thread_history_1.sqlite"
+    create_history(path)
+    with sqlite3.connect(path) as connection:
+        connection.execute(
+            "CREATE TABLE thread_items (thread_id TEXT, turn_id TEXT, created_at_ms INTEGER, item_json TEXT)"
+        )
+        connection.execute(
+            "INSERT INTO thread_turns VALUES (?, ?, ?, ?, ?, ?)",
+            ("thread-1", "turn-1", "inProgress", 1_787_700_000, None, None),
+        )
+        connection.execute(
+            "INSERT INTO thread_items VALUES (?, ?, ?, ?)",
+            ("thread-1", "turn-1", 1_787_700_123_000, "secret content"),
+        )
+
+    reader = DesktopActivityReader(path, now=lambda: NOW)
+    reader.poll()
+    snapshot = reader.status_snapshot()[0]
+
+    assert snapshot.turn_id == "turn-1"
+    assert snapshot.last_activity_at is not None
+    assert snapshot.last_activity_at.timestamp() == 1_787_700_123
+

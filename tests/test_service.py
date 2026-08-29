@@ -3,6 +3,7 @@ from datetime import datetime, timedelta, timezone
 
 import pytest
 
+from waitlab.desktop_activity import DesktopTurnSnapshot
 from waitlab.models import DefaultTaskEntry, TaskKind
 from waitlab.service import WaitLabService
 from waitlab.storage import DEFAULT_TASKS, Storage
@@ -75,7 +76,7 @@ def test_all_fixed_tasks_may_be_disabled(service):
 
 
 def test_ai_completion_does_not_stop_focus_timer(service):
-    task = service.storage.add_manual_task("核对图注")
+    task = service.storage.add_manual_task("整理一条笔记")
     service.on_ai_started("thread-1", "turn-1", when=moment())
     service.start_focus(task, when=moment(1))
 
@@ -84,6 +85,110 @@ def test_ai_completion_does_not_stop_focus_timer(service):
     assert update.ai_completed is True
     assert service.focus is not None
     assert service.focus.elapsed_seconds(moment(5)) == pytest.approx(240)
+
+
+def test_ai_active_time_excludes_permission_wait(service):
+    service.on_ai_started("thread-1", "turn-1", when=moment())
+    service.on_ai_needs_attention("thread-1", "turn-1", when=moment(2))
+    service.on_ai_resumed("turn-1", when=moment(5))
+
+    update = service.on_ai_finished("turn-1", when=moment(7))
+    session = service.storage.get_ai_session("turn-1")
+
+    assert update.ai_completed is True
+    assert session is not None
+    assert session.active_seconds == pytest.approx(4 * 60)
+    assert service.last_ai_completion_seconds == pytest.approx(4 * 60)
+
+
+def test_reconcile_closes_terminal_desktop_rows_and_freezes_active_time(service):
+    service.on_ai_started("thread-1", "turn-1", when=moment())
+    snapshot = DesktopTurnSnapshot(
+        thread_id="thread-1",
+        turn_id="turn-1",
+        status="completed",
+        started_at=moment(),
+        completed_at=moment(3),
+        last_activity_at=moment(3),
+    )
+
+    update = service.reconcile_desktop_sessions((snapshot,), now=moment(4))
+    session = service.storage.get_ai_session("turn-1")
+
+    assert update.ai_completed is True
+    assert service.storage.get_open_ai("turn-1") is None
+    assert session is not None
+    assert session.active_seconds == pytest.approx(3 * 60)
+
+
+def test_reconcile_stops_a_stale_running_row(service):
+    service.on_ai_started("thread-1", "turn-1", when=moment())
+    snapshot = DesktopTurnSnapshot(
+        thread_id="thread-1",
+        turn_id="turn-1",
+        status="inProgress",
+        started_at=moment(),
+        completed_at=None,
+        last_activity_at=moment(5),
+    )
+
+    update = service.reconcile_desktop_sessions(
+        (snapshot,),
+        now=moment(11),
+        stale_after_seconds=5 * 60,
+    )
+    session = service.storage.get_ai_session("turn-1")
+
+    assert update.ai_blocked is True
+    assert "停止计时" in (update.message or "")
+    assert service.storage.get_open_ai("turn-1") is None
+    assert session is not None
+    assert session.active_seconds == pytest.approx(5 * 60)
+
+
+def test_reconcile_stops_orphaned_running_row_after_desktop_grace(service):
+    service.on_ai_started("thread-1", "turn-orphan", when=moment())
+
+    update = service.reconcile_desktop_sessions(
+        (),
+        now=moment(6),
+    )
+    session = service.storage.get_ai_session("turn-orphan")
+
+    assert update.ai_blocked is True
+    assert "停止计时" in (update.message or "")
+    assert service.storage.get_open_ai("turn-orphan") is None
+    assert session is not None and session.status == "stale"
+
+
+def test_reconcile_stops_running_row_without_item_activity(service):
+    service.on_ai_started("thread-1", "turn-no-items", when=moment())
+    snapshot = DesktopTurnSnapshot(
+        thread_id="thread-1",
+        turn_id="turn-no-items",
+        status="inProgress",
+        started_at=moment(),
+        completed_at=None,
+        last_activity_at=None,
+    )
+
+    update = service.reconcile_desktop_sessions(
+        (snapshot,),
+        now=moment(6),
+    )
+
+    assert update.ai_blocked is True
+    assert service.storage.get_open_ai("turn-no-items") is None
+
+
+def test_running_ai_sessions_include_any_parallel_turn(service):
+    service.on_ai_started("thread-1", "turn-1", when=moment())
+    service.on_ai_started("thread-2", "turn-2", when=moment(1))
+    service.on_ai_finished("turn-2", when=moment(2), fallback_latest=False)
+
+    running = service.running_ai_sessions()
+
+    assert [session.turn_id for session in running] == ["turn-1"]
 
 
 def test_permission_wait_and_resume_do_not_interrupt_focus_timer(service):
@@ -159,6 +264,14 @@ def test_skipping_ai_round_survives_repeated_start_event(service):
     assert session is not None and session.picker_skipped is True
 
 
+def test_duplicate_ai_start_event_does_not_reopen_picker(service):
+    first = service.on_ai_started("thread-1", "turn-1", when=moment())
+    repeated = service.on_ai_started("thread-1", "turn-1", when=moment(1))
+
+    assert first.show_task_picker is True
+    assert repeated.show_task_picker is False
+
+
 def test_exact_desktop_completion_does_not_finish_an_unrelated_turn(service):
     service.on_ai_started("thread-1", "turn-1", when=moment())
 
@@ -226,6 +339,62 @@ def test_focus_pause_only_changes_focus_clock(service):
     assert service.focus is not None
     assert service.focus.is_paused is True
     assert service.focus.elapsed_seconds(moment(5)) == pytest.approx(60)
+
+
+def test_paused_focus_can_switch_and_resume_each_task_independently(service):
+    first = service.storage.add_manual_task("第一个任务")
+    second = service.storage.add_manual_task("第二个任务")
+
+    service.start_focus(first, when=moment())
+    service.pause_focus(when=moment(5))
+    service.start_focus(second, when=moment(6))
+
+    assert service.focus is not None
+    assert service.focus.task.id == second.id
+    assert service.focus.elapsed_seconds(moment(10)) == pytest.approx(4 * 60)
+    paused = service.paused_focuses()
+    assert [session.task.id for session in paused] == [first.id]
+    assert paused[0].elapsed_seconds(moment(10)) == pytest.approx(5 * 60)
+
+    service.pause_focus(when=moment(10))
+    service.start_focus(first, when=moment(12))
+
+    assert service.focus is not None
+    assert service.focus.task.id == first.id
+    assert service.focus.elapsed_seconds(moment(14)) == pytest.approx(7 * 60)
+    paused = service.paused_focuses()
+    assert [session.task.id for session in paused] == [second.id]
+    assert paused[0].elapsed_seconds(moment(14)) == pytest.approx(4 * 60)
+
+
+def test_switched_paused_focuses_are_restored_after_restart(tmp_path):
+    path = tmp_path / "waitlab.db"
+    first_storage = Storage(path)
+    first_service = WaitLabService(first_storage)
+    first = first_storage.add_manual_task("重启前任务一")
+    second = first_storage.add_manual_task("重启前任务二")
+    first_service.start_focus(first, when=moment())
+    first_service.pause_focus(when=moment(2))
+    first_service.start_focus(second, when=moment(3))
+    first_service.pause_focus(when=moment(4))
+    first_storage.close()
+
+    second_storage = Storage(path)
+    second_service = WaitLabService(second_storage)
+    try:
+        assert second_service.focus is not None
+        assert second_service.focus.task.id == second.id
+        assert second_service.focus.is_paused is True
+        assert [session.task.id for session in second_service.paused_focuses()] == [
+            second.id,
+            first.id,
+        ]
+        second_service.start_focus(first, when=moment(8))
+        assert second_service.focus is not None
+        assert second_service.focus.task.id == first.id
+        assert second_service.focus.elapsed_seconds(moment(9)) == pytest.approx(3 * 60)
+    finally:
+        second_storage.close()
 
 
 def test_manual_task_is_removed_after_focus_completion(service):
@@ -357,4 +526,7 @@ def test_existing_database_is_migrated_with_picker_skipped_column(tmp_path):
     }
 
     assert "picker_skipped" in columns
+    assert "active_seconds" in columns
+    assert "running_since" in columns
     storage.close()
+

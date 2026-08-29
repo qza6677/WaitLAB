@@ -2,12 +2,16 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
+import shutil
 import subprocess
 import tempfile
 import time
 from dataclasses import dataclass
 from pathlib import Path
+from threading import Thread
 from urllib.error import HTTPError, URLError
+from urllib.parse import urlparse
 from urllib.request import Request, urlopen
 
 RELEASE_API = "https://api.github.com/repos/qza6677/WaitLAB/releases/latest"
@@ -15,10 +19,40 @@ USER_AGENT = "WaitLAB"
 RETRY_COUNT = 3
 RETRY_DELAYS = (2, 4)
 CHUNK_SIZE = 1024 * 1024
+TRUSTED_RELEASE_HOSTS = {
+    "api.github.com",
+    "github.com",
+    "objects.githubusercontent.com",
+    "release-assets.githubusercontent.com",
+}
 
 
-def version_tuple(value: str) -> tuple[int, ...]:
-    return tuple(int(part) for part in value.strip().lstrip("v").split("."))
+def _validate_release_url(value: str, *, label: str) -> str:
+    """Accept only HTTPS URLs served by GitHub's release infrastructure."""
+
+    parsed = urlparse(value)
+    host = (parsed.hostname or "").casefold()
+    if parsed.scheme.casefold() != "https" or (
+        host not in TRUSTED_RELEASE_HOSTS and not host.endswith(".githubusercontent.com")
+    ):
+        raise ValueError(f"Release {label} URL is not trusted")
+    return value
+
+
+def version_tuple(value: str) -> tuple[object, ...]:
+    """Return a comparable key for stable and pre-release SemVer labels."""
+
+    normalized = value.strip().lstrip("v")
+    match = re.fullmatch(r"(\d+)\.(\d+)\.(\d+)(?:-([0-9A-Za-z.-]+))?(?:\+[0-9A-Za-z.-]+)?", normalized)
+    if match is None:
+        raise ValueError(f"无效的版本号：{value}")
+    major, minor, patch, prerelease = match.groups()
+    if prerelease is None:
+        return (int(major), int(minor), int(patch), 1, ())
+    parts: list[tuple[int, object]] = []
+    for part in prerelease.split("."):
+        parts.append((0, int(part)) if part.isdigit() else (1, part.casefold()))
+    return (int(major), int(minor), int(patch), 0, tuple(parts))
 
 
 @dataclass(frozen=True, slots=True)
@@ -29,8 +63,26 @@ class ReleaseInfo:
     page_url: str
 
 
+def describe_update_error(error: BaseException) -> str:
+    """Turn low-level updater failures into short, actionable UI messages."""
+    text = str(error).strip()
+    lowered = text.lower()
+    if "10060" in text or "timed out" in lowered or "timeout" in lowered:
+        return "无法连接 GitHub，网络请求超时；已自动重试，请稍后再试。"
+    if "sha-256" in lowered or "sha256" in lowered:
+        return "更新包校验失败，未安装本次更新。"
+    if "not trusted" in lowered or ("windows" in lowered and "installer" in lowered):
+        return "鏇存柊鏂囦欢鏍煎紡鎴栦笅杞藉湴鍧€涓嶅彲淇°€傛湭瀹夎鏈鏇存柊銆?"
+    if "403" in text or "429" in text:
+        return "GitHub 暂时限制了请求，请稍后再试。"
+    if not text:
+        return "更新失败，请稍后再试。"
+    return f"更新失败：{text}"
+
+
 def _request_bytes(url: str, *, timeout: int, attempts: int = RETRY_COUNT) -> bytes:
     """Read a small GitHub response with retries for transient network errors."""
+    attempts = max(1, int(attempts))
     last_error: Exception | None = None
     for attempt in range(attempts):
         request = Request(
@@ -62,6 +114,7 @@ def _download_to_file(
     attempts: int = RETRY_COUNT,
 ) -> None:
     """Stream a large download to disk and restart cleanly after a timeout."""
+    attempts = max(1, int(attempts))
     last_error: Exception | None = None
     for attempt in range(attempts):
         target.unlink(missing_ok=True)
@@ -86,32 +139,89 @@ def _download_to_file(
 
 
 def fetch_latest_release(current_version: str, timeout: int = 15) -> ReleaseInfo | None:
-    payload = json.loads(_request_bytes(RELEASE_API, timeout=timeout).decode("utf-8"))
+    try:
+        payload = json.loads(_request_bytes(RELEASE_API, timeout=timeout).decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ValueError("GitHub 返回了无效的更新响应") from exc
+    if not isinstance(payload, dict):
+        raise ValueError("GitHub 返回了无效的更新响应")
     version = str(payload.get("tag_name", "")).lstrip("v")
     if not version or version_tuple(version) <= version_tuple(current_version):
         return None
-    assets = {asset["name"]: asset["browser_download_url"] for asset in payload.get("assets", [])}
+    raw_assets = payload.get("assets", [])
+    if not isinstance(raw_assets, list):
+        raise ValueError("GitHub 返回了无效的更新资源列表")
+    assets = {
+        asset["name"]: asset["browser_download_url"]
+        for asset in raw_assets
+        if isinstance(asset, dict)
+        and isinstance(asset.get("name"), str)
+        and isinstance(asset.get("browser_download_url"), str)
+    }
     installer_name = f"WaitLAB-Setup-{version}.exe"
     if installer_name not in assets or "SHA256SUMS.txt" not in assets:
         raise ValueError("Release 缺少安装包或 SHA256SUMS.txt")
-    return ReleaseInfo(version, assets[installer_name], assets["SHA256SUMS.txt"], str(payload.get("html_url", "")))
+    return ReleaseInfo(
+        version,
+        _validate_release_url(assets[installer_name], label="installer"),
+        _validate_release_url(assets["SHA256SUMS.txt"], label="checksums"),
+        str(payload.get("html_url", "")),
+    )
+
+
+def _validate_installer_file(path: Path) -> None:
+    """Reject an HTML/error response masquerading as an installer."""
+
+    with path.open("rb") as stream:
+        if stream.read(2) != b"MZ":
+            raise ValueError("下载的更新文件不是有效的 Windows 安装程序")
 
 
 def download_verified_installer(release: ReleaseInfo) -> Path:
+    _validate_release_url(release.installer_url, label="installer")
+    _validate_release_url(release.checksums_url, label="checksums")
     target = Path(tempfile.mkdtemp(prefix="waitlab-update-")) / f"WaitLAB-Setup-{release.version}.exe"
     try:
         _download_to_file(release.installer_url, target, timeout=300)
+        _validate_installer_file(target)
         manifest = _request_bytes(release.checksums_url, timeout=30).decode("ascii")
     except Exception:
-        target.unlink(missing_ok=True)
+        shutil.rmtree(target.parent, ignore_errors=True)
         raise
-    expected = next((line.split()[0].upper() for line in manifest.splitlines() if target.name in line), None)
+    expected = None
+    for line in manifest.splitlines():
+        fields = line.split()
+        if len(fields) < 2:
+            continue
+        filename = fields[-1].lstrip("*")
+        if Path(filename).name == target.name:
+            expected = fields[0].upper()
+            break
     actual = hashlib.sha256(target.read_bytes()).hexdigest().upper()
     if not expected or actual != expected:
-        target.unlink(missing_ok=True)
+        shutil.rmtree(target.parent, ignore_errors=True)
         raise ValueError("更新包 SHA-256 校验失败")
     return target
 
 
 def launch_installer(path: Path) -> None:
     subprocess.Popen([str(path), "/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART", "/CLOSEAPPLICATIONS", "/RESTARTAPPLICATIONS"])
+
+
+def cleanup_download_directory(path: Path, delay_seconds: float = 3.0) -> None:
+    """Remove an updater's temporary directory after the installer exits."""
+
+    parent = path.parent
+
+    def worker() -> None:
+        # Give Windows time to spawn the installer before removing its parent.
+        time.sleep(max(0.0, delay_seconds))
+        for _ in range(10):
+            try:
+                shutil.rmtree(parent, ignore_errors=False)
+                return
+            except OSError:
+                time.sleep(1.0)
+
+    Thread(target=worker, daemon=True, name="waitlab-update-cleanup").start()
+

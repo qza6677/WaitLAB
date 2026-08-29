@@ -32,7 +32,7 @@ def render() -> None:
         app.processEvents()
         window.grab().save(str(output_dir / "waiting-picker.png"))
 
-        task = service.storage.add_manual_task("核对图 3 的统计标注与图注")
+        task = service.storage.add_manual_task("整理一条待办的下一步")
         window.start_focus(task)
         app.processEvents()
         window.grab().save(str(output_dir / "focus-session.png"))
@@ -43,3 +43,4 @@ def render() -> None:
 
 if __name__ == "__main__":
     render()
+

@@ -1,6 +1,6 @@
 # WaitLAB
 
-WaitLAB 是一个 Windows 科研等待助手。Codex 开始执行后，它会立即启动 AI 等待计时并弹出一个微任务；Codex 完成时只提醒，不会停止正在进行的微任务计时。
+WaitLAB 是一个 Windows 等待助手。Codex 对话开始后，它会立即弹出一个 Waiting Task；Codex 输出时在 Cookie 气泡中提醒你选择继续、暂停或完成当前微任务。
 
 ![等待任务选择](artifacts/waiting-picker-native.png)
 
@@ -16,11 +16,12 @@ WaitLAB 是一个 Windows 科研等待助手。Codex 开始执行后，它会立
 - Codex 运行、完成、中断和失败状态识别
 - Codex 连接状态显示：已连接、Hook 兜底和降级模式
 - Codex 等待权限批准时提醒（桌面状态可用或可选 Hook 已连接时），微任务继续计时
-- 设置中心：弹出方式、完成通知、提示音和 Windows 开机启动
-- 固定循环任务可添加、重命名、删除、启停和排序
+- 设置中心：弹出方式、Cookie 气泡提醒、提示音和 Windows 开机启动
+- Waiting Task 统一维护手动任务与固定循环任务，可添加标签、启停和排序
+- 支持按天、周、月查看 Waiting Task 专注时长和标签分布；Codex 仅作为活动提醒来源，不计运行时长
+- 今日完成任务可展开查看每段记录，并删除单独的计时记录
 - “本轮跳过”会忽略当前等待轮次，但不影响下一条 Codex 指令
-- AI 等待与微任务两套独立计时
-- Codex 完成提醒，微任务继续计时
+- Codex 活动状态与 Waiting Task 计时分离；Codex 输出不会自动停止微任务
 - 手动任务严格优先于固定任务
 - 没有手动任务时，7 个固定任务依次循环
 - 暂停、继续、完成和放回任务池
@@ -52,10 +53,14 @@ python run_waitlab.py
 
 已经构建好的文件位于 `release`：
 
-- `WaitLAB-Setup-0.5.5.exe`：简体中文安装器，安装到当前用户目录，不需要管理员权限。
-- `WaitLAB.exe`：无需安装的单文件便携版。
+- `WaitLAB.exe`：本次本地验证用的单文件便携版，无需安装。
+- `WaitLAB-Setup-0.5.14.exe`：若构建环境安装了 Inno Setup 6，则会额外生成简体中文安装器。
+
+默认的 Waiting Task 任务和标签面向通用的工作、学习、编码与整理场景；升级旧版本时，已有自定义任务、历史记录和旧标签会继续保留。
 
 安装版和源码版使用同一个本地数据库，升级不会清空任务或历史计时。
+
+构建时版本号唯一取自 `pyproject.toml`；`build_release.ps1` 会自动生成 Windows 文件版本信息，安装器版本也从生成的 EXE 读取，避免标签和源码版本不一致。
 
 ### 计时语义
 
@@ -75,7 +80,7 @@ WaitLAB 默认以只读方式检查 Codex 桌面端维护的本机任务状态�
 %USERPROFILE%\.codex\thread_history_1.sqlite
 ```
 
-它只查询 `thread_id`、`turn_id`、`status`、`started_at` 和 `completed_at`，不会查询消息、任务标题、工作目录、错误详情或 item JSON。连接成功后，桌宠顶部会显示“Codex · 已连接”。
+它只查询 `thread_id`、`turn_id`、`status`、`started_at` 和 `completed_at`，不会查询消息、任务标题、工作目录、错误详情或 item JSON。连接成功后，桌宠顶部会显示 Codex 活动状态；该状态只在 WaitLAB 运行期间有效，不会累计 Codex 时长。
 
 这个本机数据库是桌面端的内部状态源，未来 Codex 升级若改变结构，WaitLAB 会自动进入“降级模式”，不会影响手动任务、计时数据或快捷键。
 
@@ -94,7 +99,7 @@ Hook 不再是 Windows 桌面端的必选依赖。若你同时使用独立 Codex
 3. 添加 `UserPromptSubmit`、`PermissionRequest`、`PostToolUse` 和 `Stop` 四个 command hook。
 4. 将 hook 指向当前项目中的 `hook_bridge.py`。
 
-注意：`/hooks` 是独立 Codex CLI 中的审核命令，不是插件，当前 Windows 桌面端没有这个入口。仅使用 Windows 桌面端时，无需安装或审核 Hook。桌面端自身也会发送任务完成和权限请求通知。
+注意：`/hooks` 是独立 Codex CLI 中的审核命令，不是插件，当前 Windows 桌面端没有这个入口。仅使用 Windows 桌面端时，无需安装或审核 Hook。WaitLAB 不发送 Codex 生命周期的 Windows 系统通知，相关提示统一显示在 Cookie 气泡内。
 
 卸载：
 
@@ -122,7 +127,7 @@ Hook 不再是 Windows 桌面端的必选依赖。若你同时使用独立 Codex
 - 手动任务全部完成或删除后，才显示固定滚动任务。
 - 完成固定任务后，所选任务移动到循环队尾。
 - Codex 完成只结束 AI 等待会话，不会修改微任务状态。
-- 在设置中可以编辑固定循环；未勾选的任务不会出现在推荐区。
+- 在 Waiting Task 页面可以编辑固定循环；未勾选的任务不会出现在推荐区。
 - 所有固定任务都停用且没有手动任务时，选择区会提示前往设置。
 - “本轮跳过”只对当前 `turn_id` 生效，程序重启后也不会重复弹出这一轮。
 
@@ -132,8 +137,8 @@ Hook 不再是 Windows 桌面端的必选依赖。若你同时使用独立 Codex
 
 - **弹出并置顶**：收到新指令时立即显示任务选择。
 - **静默显示**：显示窗口但不主动抢占前台。
-- **仅托盘提醒**：不展开窗口，通过托盘通知提示。
-- 可分别开关 Codex 完成通知和提示音。
+- 旧版“仅托盘提醒”配置会兼容读取，但新版会改为在 Cookie 气泡内显示。
+- 可开关 Cookie 气泡内的 Codex 提示和提示音。
 - 可启用当前用户级的 Windows 登录自启动，不需要管理员权限。
 
 ## 桌宠交互
@@ -142,7 +147,7 @@ Hook 不再是 Windows 桌面端的必选依赖。若你同时使用独立 Codex
 - 拖动桌宠可以改变垂直位置，松手后自动吸附到当前屏幕左侧。
 - 右键桌宠可打开任务池、设置、隐藏和退出菜单。
 - 已有微任务时，新的 Codex 指令不会重复展开任务选择。
-- Codex 完成、失败或等待操作时，只改变桌宠状态并发送通知，播放器和微任务计时保持不变。
+- Codex 完成、失败或等待操作时，在 Cookie 气泡内提示；播放器和微任务计时保持不变。
 
 ## 构建 Windows 安装包
 
@@ -186,3 +191,4 @@ hook_bridge.py         隐私过滤后的 Codex hook 桥接
 build_release.ps1      Windows 便携版与安装器构建脚本
 packaging/             图标、版本信息和 Inno Setup 配置
 ```
+

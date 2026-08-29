@@ -27,6 +27,18 @@ def test_invalid_popup_mode_falls_back_to_raise(tmp_path):
     storage.close()
 
 
+def test_in_app_and_system_notifications_are_independent(tmp_path):
+    storage = Storage(tmp_path / "waitlab.db")
+    expected = Preferences(in_app_notifications=False, completion_notifications=True)
+    expected.save(storage)
+
+    loaded = Preferences.load(storage)
+
+    assert loaded.in_app_notifications is False
+    assert loaded.completion_notifications is True
+    storage.close()
+
+
 def test_source_autostart_command_quotes_pythonw_and_script(tmp_path):
     python = tmp_path / "Python Folder" / "python.exe"
     python.parent.mkdir()
@@ -47,3 +59,4 @@ def test_packaged_autostart_command_only_uses_executable(tmp_path):
     executable.write_text("", encoding="utf-8")
 
     assert autostart_command(executable, frozen=True) == f'"{executable.resolve()}"'
+

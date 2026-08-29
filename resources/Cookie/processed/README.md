@@ -13,7 +13,7 @@ States are in row-major order:
 
 1. `idle` — idle/standby
 2. `waiting` — waiting for an AI response
-3. `working` — actively writing or researching
+3. `working` — actively working on a task
 4. `paused` — micro-task paused/resting
 5. `attention` — needs attention
 6. `ai-complete` — AI response finished
@@ -25,3 +25,4 @@ States are in row-major order:
 12. `updating` — update in progress
 
 The original file in the parent directory is not overwritten.
+

@@ -83,15 +83,15 @@ def resolve_cookie_state(context: CookieContext) -> CookieState:
 
     if context.ai_needs_attention:
         return CookieState.ATTENTION
-    if context.task_completion_visible and not context.focus_active and not context.ai_active:
+    # Completing a micro-task is an explicit user action and should be
+    # visible even when the Codex turn has not finished yet.
+    if context.task_completion_visible and not context.focus_active:
         return CookieState.TASK_COMPLETE
     if context.focus_active:
         if context.terminal_error:
             return CookieState.ERROR
         if context.completion_visible:
             return CookieState.AI_COMPLETE
-        if context.ai_active:
-            return CookieState.WAITING
         if context.focus_paused:
             return CookieState.PAUSED
         return CookieState.WORKING
@@ -146,18 +146,24 @@ class CookieAssets:
     def __init__(self, asset_dir: Path | str | None = None) -> None:
         self.asset_dir = Path(asset_dir) if asset_dir is not None else default_cookie_asset_dir()
 
-    def path_for(self, state: CookieState | str) -> Path | None:
+    def path_for(self, state: CookieState | str, display_size: int | None = None) -> Path | None:
         if self.asset_dir is None:
             return None
         state_value = coerce_cookie_state(state)
-        path = self.asset_dir / COOKIE_STATE_FILES[state_value]
+        asset_dir = self.asset_dir
+        if display_size is not None and display_size > 96:
+            high_res_dir = self.asset_dir.parent / "sprites-256"
+            if high_res_dir.is_dir():
+                asset_dir = high_res_dir
+        path = asset_dir / COOKIE_STATE_FILES[state_value]
         if path.is_file():
             return path
         if state_value is not CookieState.IDLE:
-            fallback = self.asset_dir / COOKIE_STATE_FILES[CookieState.IDLE]
+            fallback = asset_dir / COOKIE_STATE_FILES[CookieState.IDLE]
             if fallback.is_file():
                 return fallback
         return None
 
     def available(self) -> bool:
         return self.path_for(CookieState.IDLE) is not None
+

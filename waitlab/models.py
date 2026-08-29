@@ -27,6 +27,9 @@ class TaskKind(StrEnum):
     DEFAULT = "default"
 
 
+DEFAULT_TAG = "未分类"
+
+
 class FocusOutcome(StrEnum):
     COMPLETED = "completed"
     ABANDONED = "abandoned"
@@ -38,12 +41,14 @@ class Task:
     title: str
     kind: TaskKind
     sort_order: int = 0
+    tag: str = DEFAULT_TAG
 
 
 @dataclass(frozen=True, slots=True)
 class DefaultTaskEntry:
     title: str
     enabled: bool = True
+    tag: str = DEFAULT_TAG
 
 
 @dataclass(slots=True)
@@ -65,6 +70,33 @@ class FocusSession:
         return max(0.0, elapsed)
 
 
+@dataclass(frozen=True, slots=True)
+class CompletedTaskSummary:
+    """A compact daily roll-up used by the picker history list."""
+
+    task_id: int | None
+    title: str
+    kind: TaskKind
+    total_seconds: float
+    completed_count: int
+    last_completed_at: datetime
+    tag: str = DEFAULT_TAG
+
+
+@dataclass(frozen=True, slots=True)
+class CompletedFocusRecord:
+    """One completed Waiting Task focus segment shown in the expandable history."""
+
+    id: int
+    task_id: int | None
+    title: str
+    kind: TaskKind
+    tag: str
+    started_at: datetime
+    ended_at: datetime
+    duration_seconds: float
+
+
 @dataclass(slots=True)
 class AiSession:
     id: int
@@ -74,10 +106,21 @@ class AiSession:
     ended_at: datetime | None = None
     status: str = "running"
     picker_skipped: bool = False
+    active_seconds: float = 0.0
+    running_since: datetime | None = None
 
     def elapsed_seconds(self, now: datetime | None = None) -> float:
         endpoint = self.ended_at or now or utc_now()
         return max(0.0, (endpoint - self.started_at).total_seconds())
+
+    def active_elapsed_seconds(self, now: datetime | None = None) -> float:
+        """Return only the time spent in an explicitly running state."""
+
+        total = max(0.0, float(self.active_seconds))
+        if self.running_since is not None and self.ended_at is None:
+            endpoint = now or utc_now()
+            total += max(0.0, (endpoint - self.running_since).total_seconds())
+        return total
 
 
 @dataclass(frozen=True, slots=True)
@@ -89,3 +132,9 @@ class ServiceUpdate:
     ai_resumed: bool = False
     focus_changed: bool = False
     message: str | None = None
+    # Lifecycle identity is useful to the UI for de-duplicating completion
+    # reminders.  It deliberately carries no duration information: Codex is
+    # an event source, while Waiting Task is the only timed activity.
+    ai_turn_id: str | None = None
+    ai_status: str | None = None
+

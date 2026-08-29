@@ -18,9 +18,18 @@ def _read_bool(storage: Storage, key: str, default: bool) -> bool:
     return raw not in {"0", "false", "no", "off"}
 
 
+def _read_int(storage: Storage, key: str, default: int, minimum: int, maximum: int) -> int:
+    try:
+        value = int(storage.get_setting(key, str(default)))
+    except (TypeError, ValueError):
+        value = default
+    return max(minimum, min(maximum, value))
+
+
 @dataclass(frozen=True, slots=True)
 class Preferences:
     popup_mode: PopupMode = PopupMode.RAISE
+    in_app_notifications: bool = True
     completion_notifications: bool = True
     notification_sound: bool = True
     always_on_top: bool = True
@@ -28,6 +37,7 @@ class Preferences:
     quiet_hours_enabled: bool = False
     quiet_start: str = "22:00"
     quiet_end: str = "08:00"
+    cookie_size: int = 88
 
     @classmethod
     def load(cls, storage: Storage) -> "Preferences":
@@ -38,6 +48,11 @@ class Preferences:
             popup_mode = PopupMode.RAISE
         return cls(
             popup_mode=popup_mode,
+            in_app_notifications=_read_bool(
+                storage,
+                "in_app_notifications",
+                True,
+            ),
             completion_notifications=_read_bool(
                 storage,
                 "completion_notifications",
@@ -49,10 +64,15 @@ class Preferences:
             quiet_hours_enabled=_read_bool(storage, "quiet_hours_enabled", False),
             quiet_start=storage.get_setting("quiet_start", "22:00"),
             quiet_end=storage.get_setting("quiet_end", "08:00"),
+            cookie_size=_read_int(storage, "cookie_size", 88, 48, 160),
         )
 
     def save(self, storage: Storage) -> None:
         storage.set_setting("popup_mode", self.popup_mode.value)
+        storage.set_setting(
+            "in_app_notifications",
+            "1" if self.in_app_notifications else "0",
+        )
         storage.set_setting(
             "completion_notifications",
             "1" if self.completion_notifications else "0",
@@ -69,6 +89,7 @@ class Preferences:
             storage.set_setting(key, "1" if enabled else "0")
         storage.set_setting("quiet_start", self.quiet_start)
         storage.set_setting("quiet_end", self.quiet_end)
+        storage.set_setting("cookie_size", str(max(48, min(160, self.cookie_size))))
 
     def is_quiet_now(self, now: time | None = None) -> bool:
         if not self.quiet_hours_enabled:
@@ -80,3 +101,4 @@ class Preferences:
             return False
         current = now or datetime.now().time()
         return start <= current < end if start <= end else current >= start or current < end
+
