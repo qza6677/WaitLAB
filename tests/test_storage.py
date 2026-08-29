@@ -179,6 +179,60 @@ def test_period_stats_include_codex_and_waiting_task_time(tmp_path):
         storage.close()
 
 
+def test_daily_tag_series_splits_sessions_and_matches_period_totals(tmp_path):
+    storage = Storage(tmp_path / "waitlab.db")
+    try:
+        local_now = datetime(2026, 8, 12, 12, 0, tzinfo=timezone.utc).astimezone()
+        day_start = local_now.replace(hour=0, minute=0, second=0, microsecond=0)
+        monday = day_start - timedelta(days=2)
+        reading = storage.add_manual_task("周一阅读", "文献阅读")
+        session = storage.start_focus(reading, when=monday.replace(hour=10))
+        storage.end_focus(
+            session,
+            FocusOutcome.COMPLETED,
+            when=monday.replace(hour=11),
+        )
+
+        cross_midnight = storage.add_manual_task("跨日写作", "论文写作")
+        session = storage.start_focus(
+            cross_midnight,
+            when=(day_start - timedelta(days=1)).replace(hour=23, minute=30),
+        )
+        storage.end_focus(
+            session,
+            FocusOutcome.COMPLETED,
+            when=day_start.replace(minute=30),
+        )
+
+        series = storage.tag_waiting_daily_series("week", local_now)
+        assert len(series) == 7
+        assert series[0].tag_seconds["文献阅读"] == pytest.approx(60 * 60)
+        assert series[1].tag_seconds["论文写作"] == pytest.approx(30 * 60)
+        assert series[2].tag_seconds["论文写作"] == pytest.approx(30 * 60)
+
+        weekly_totals = storage.tag_waiting_seconds("week", local_now)
+        series_totals: dict[str, float] = {}
+        for bucket in series:
+            for tag, seconds in bucket.tag_seconds.items():
+                series_totals[tag] = series_totals.get(tag, 0.0) + seconds
+        assert series_totals == pytest.approx(weekly_totals)
+    finally:
+        storage.close()
+
+
+def test_daily_tag_series_returns_every_day_of_month(tmp_path):
+    storage = Storage(tmp_path / "waitlab.db")
+    try:
+        local_now = datetime(2026, 2, 12, 12, 0, tzinfo=timezone.utc).astimezone()
+        series = storage.tag_waiting_daily_series("month", local_now)
+        assert len(series) == 28
+        assert series[0].start.day == 1
+        assert series[-1].start.day == 28
+        assert all(bucket.tag_seconds == {} for bucket in series)
+    finally:
+        storage.close()
+
+
 def test_waiting_stats_handle_cross_midnight_and_open_session(tmp_path):
     storage = Storage(tmp_path / "waitlab.db")
     try:
@@ -268,4 +322,3 @@ def test_expired_history_archives_are_purged_with_segments(tmp_path):
         ).fetchone() is None
     finally:
         storage.close()
-

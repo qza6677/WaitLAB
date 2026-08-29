@@ -8,11 +8,19 @@ import pytest
 from PySide6.QtCore import QObject, QPoint, QRect, QThread, QTimer, Qt, Signal, Slot
 from PySide6.QtWidgets import QApplication, QMessageBox, QPushButton
 
-from waitlab.models import FocusOutcome, ServiceUpdate, Task
+from waitlab.models import FocusOutcome, ServiceUpdate, Task, TaskKind
 from waitlab.app import DesktopActivityReceiver
 from waitlab.service import WaitLabService
 from waitlab.storage import Storage
-from waitlab.ui import PetWindow, TagChipBar, TagManagerDialog, TaskManagerDialog
+from waitlab.ui import (
+    DailyTagStackedChart,
+    PetWindow,
+    StatisticsDialog,
+    TagChipBar,
+    TagDonutChart,
+    TagManagerDialog,
+    TaskManagerDialog,
+)
 
 
 @pytest.fixture(scope="session")
@@ -174,6 +182,58 @@ def test_paused_player_can_open_switcher_and_start_another_task(pet_window, qt_a
     assert [session.task.id for session in pet_window.service.paused_focuses()] == [first.id]
 
 
+def test_switcher_includes_fixed_cycle_tasks_with_manual_tasks(pet_window, qt_app):
+    current = pet_window.service.storage.add_manual_task("当前手动任务")
+    fixed = pet_window.service.fixed_cycle_tasks()[0]
+    pet_window.start_focus(current)
+    _flush(qt_app)
+
+    switch_button = pet_window.focus_card.findChild(QPushButton, "playerSwitchButton")
+    assert switch_button is not None
+    switch_button.click()
+    _flush(qt_app)
+
+    fixed_button = next(
+        button
+        for button in pet_window.suggestion_container.findChildren(QPushButton)
+        if button.objectName() == "taskButton" and fixed.title in button.text()
+    )
+    fixed_button.click()
+    _flush(qt_app)
+
+    assert pet_window.service.focus is not None
+    assert pet_window.service.focus.task.kind is TaskKind.DEFAULT
+    assert pet_window.service.focus.task.title == fixed.title
+
+
+def test_statistics_dialog_shows_donut_and_daily_stacked_chart(qt_app, tmp_path):
+    storage = Storage(tmp_path / "waitlab.db")
+    service = WaitLabService(storage)
+    task = storage.add_manual_task("统计界面任务", "阅读")
+    now = datetime.now().astimezone().replace(microsecond=0)
+    session = storage.start_focus(task, when=now - timedelta(minutes=20))
+    storage.end_focus(session, FocusOutcome.COMPLETED, when=now - timedelta(minutes=5))
+    dialog = StatisticsDialog(service)
+    try:
+        assert isinstance(dialog.today_donut, TagDonutChart)
+        assert isinstance(dialog.series_chart, DailyTagStackedChart)
+        dialog.show()
+        _flush(qt_app)
+
+        assert dialog.today_donut._total == pytest.approx(15 * 60, abs=2)
+        assert len(dialog.series_chart._buckets) == 7
+        assert dialog.week_button.isChecked()
+        assert "阅读" in dialog.today_legend.text()
+
+        dialog.month_button.click()
+        _flush(qt_app)
+        assert dialog._period == "month"
+        assert len(dialog.series_chart._buckets) in {28, 29, 30, 31}
+    finally:
+        dialog.close()
+        storage.close()
+
+
 def test_minimized_picker_restores_by_clicking_cookie(pet_window, qt_app):
     pet_window.task_picker_open = True
     pet_window.refresh()
@@ -236,6 +296,28 @@ def test_home_and_task_pool_use_colored_tag_chips(qt_app, tmp_path):
         window.close()
         dialog.close()
         storage.close()
+
+
+def test_compact_tag_bar_height_update_is_idempotent(qt_app):
+    bar = TagChipBar(["未分类", "论文写作", "文献阅读", "Vibe coding", "摸鱼", "会议准备"])
+    bar.resize(120, 40)
+    bar.show()
+    emissions: list[int] = []
+    bar.geometry_changed.connect(lambda: emissions.append(1))
+    try:
+        bar.set_compact(True)
+        _flush(qt_app)
+        first_count = len(emissions)
+        # This mirrors PetWindow._fit_to_content: repeated compact styling
+        # must not reset a wrapped bar's minimum height and emit forever.
+        for _ in range(8):
+            bar.set_compact(True)
+            bar.sync_height()
+            _flush(qt_app)
+        assert len(emissions) == first_count
+        assert first_count <= 1
+    finally:
+        bar.close()
 
 
 def test_legacy_tray_mode_uses_cookie_picker(qt_app, tmp_path):
@@ -319,6 +401,39 @@ def test_completed_history_row_can_restart_same_task(tmp_path, qt_app):
         assert service.focus is not None
         assert service.focus.task.id == task.id
         assert service.focus.task.title == task.title
+    finally:
+        window.timer.stop()
+        window.close()
+        storage.close()
+
+
+def test_completed_history_continue_switches_from_active_focus(tmp_path, qt_app):
+    storage = Storage(tmp_path / "waitlab.db")
+    service = WaitLabService(storage)
+    current = storage.add_manual_task("当前正在进行的任务")
+    completed = storage.add_manual_task("从历史记录继续的任务")
+    now = datetime.now().astimezone().replace(microsecond=0)
+    session = storage.start_focus(completed, when=now - timedelta(minutes=4))
+    storage.end_focus(session, FocusOutcome.COMPLETED, when=now)
+    service.start_focus(current, when=now)
+    service.pause_focus(when=now + timedelta(seconds=1))
+    window = PetWindow(service)
+    try:
+        window.task_picker_open = True
+        window.refresh()
+        _flush(qt_app)
+        assert window.today_completed_list.count() == 1
+        row = window.today_completed_list.itemWidget(window.today_completed_list.item(0))
+        assert row is not None
+        continue_button = row.findChild(QPushButton, "completedContinueButton")
+        assert continue_button is not None
+        continue_button.click()
+        _flush(qt_app)
+        assert service.focus is not None
+        assert service.focus.task.id == completed.id
+        assert service.focus.is_paused is False
+        paused = service.paused_focuses()
+        assert [session.task.id for session in paused] == [current.id]
     finally:
         window.timer.stop()
         window.close()
@@ -536,4 +651,3 @@ def test_tag_manager_deletes_multiple_selected_tags(qt_app, tmp_path, monkeypatc
     finally:
         dialog.close()
         storage.close()
-

@@ -1,6 +1,6 @@
 [project]
 name = "waitlab"
-version = "0.5.14"
+version = "0.5.15"
 description = "A local Windows waiting assistant that turns Codex wait time into focused microtasks."
 requires-python = ">=3.11"
 dependencies = [
@@ -32,4 +32,3 @@ disable_error_code = ["arg-type"]
 [[tool.mypy.overrides]]
 module = ["waitlab.ui"]
 disable_error_code = ["arg-type", "attr-defined", "name-defined", "override", "union-attr"]
-

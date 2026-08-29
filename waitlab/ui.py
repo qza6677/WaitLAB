@@ -4,12 +4,14 @@ import math
 import random
 import time
 import hashlib
+from html import escape
 from enum import StrEnum
 from pathlib import Path
 
 from PySide6.QtCore import (
     QEasingCurve,
     QPoint,
+    QPointF,
     QRect,
     QRectF,
     Qt,
@@ -19,7 +21,17 @@ from PySide6.QtCore import (
     QVariantAnimation,
     Signal,
 )
-from PySide6.QtGui import QColor, QIcon, QKeyEvent, QMouseEvent, QPainter, QPainterPath, QPen, QPixmap
+from PySide6.QtGui import (
+    QColor,
+    QFont,
+    QIcon,
+    QKeyEvent,
+    QMouseEvent,
+    QPainter,
+    QPainterPath,
+    QPen,
+    QPixmap,
+)
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QApplication,
@@ -65,6 +77,7 @@ from .models import (
     CompletedFocusRecord,
     DefaultTaskEntry,
     ServiceUpdate,
+    TagTimeBucket,
     Task,
 )
 from .preferences import PopupMode, Preferences
@@ -528,6 +541,7 @@ class TagChipBar(QWidget):
         self._selected = ""
         self._buttons: dict[str, QPushButton] = {}
         self._compact = False
+        self._sync_height_pending = False
         self._button_group = QButtonGroup(self)
         self._button_group.setExclusive(True)
         self._layout = FlowLayout(self)
@@ -539,10 +553,25 @@ class TagChipBar(QWidget):
     def set_compact(self, compact: bool = True) -> None:
         """Use a denser chip layout for narrow home-page controls."""
 
-        self._compact = bool(compact)
-        self._layout.setSpacing(4 if self._compact else 6)
-        self.setMinimumHeight(30 if self._compact else 38)
+        next_compact = bool(compact)
+        mode_changed = next_compact != self._compact
+        # This method is also called after the parent card is polished.  The
+        # old implementation always reset the baseline minimum height here,
+        # which changed a wrapped chip bar from (for example) 54px back to
+        # 30px and emitted geometry_changed again.  Only change that baseline
+        # when the mode changes; repeated calls are otherwise idempotent.
+        self._compact = next_compact
+        if mode_changed:
+            self._layout.setSpacing(4 if self._compact else 6)
+            self.setMinimumHeight(30 if self._compact else 38)
+        density_changed = mode_changed
         for button in self._buttons.values():
+            should_reapply = mode_changed or (
+                self._compact and button.height() != 24
+            ) or (not self._compact and bool(button.styleSheet()))
+            if not should_reapply:
+                continue
+            density_changed = True
             self._apply_chip_density(button)
             button.style().unpolish(button)
             button.style().polish(button)
@@ -550,8 +579,9 @@ class TagChipBar(QWidget):
             # polished; Qt styles may restore their default button metric.
             if self._compact:
                 button.setFixedHeight(24)
-        self.updateGeometry()
-        QTimer.singleShot(0, self.sync_height)
+        if mode_changed or density_changed:
+            self.updateGeometry()
+            self._schedule_sync_height()
 
     def tags(self) -> list[str]:
         return list(self._tags)
@@ -608,7 +638,7 @@ class TagChipBar(QWidget):
             self._buttons[tag] = button
         self._select(target, emit=False)
         self.updateGeometry()
-        QTimer.singleShot(0, self.sync_height)
+        self._schedule_sync_height()
 
     def _apply_chip_density(self, button: QPushButton) -> None:
         if self._compact:
@@ -635,7 +665,19 @@ class TagChipBar(QWidget):
 
     def resizeEvent(self, event) -> None:  # noqa: N802
         super().resizeEvent(event)
-        QTimer.singleShot(0, self.sync_height)
+        self._schedule_sync_height()
+
+    def _schedule_sync_height(self) -> None:
+        """Coalesce queued height recalculations into one GUI callback."""
+
+        if self._sync_height_pending:
+            return
+        self._sync_height_pending = True
+        QTimer.singleShot(0, self._run_scheduled_sync_height)
+
+    def _run_scheduled_sync_height(self) -> None:
+        self._sync_height_pending = False
+        self.sync_height()
 
     def sync_height(self) -> None:
         if self.width() <= 0:
@@ -1195,14 +1237,309 @@ class TaskManagerDialog(QDialog):
         dialog.exec()
 
 
+def _chart_duration(seconds: float) -> str:
+    """Format a compact chart axis/tooltip duration."""
+
+    value = max(0.0, float(seconds))
+    if value >= 3600:
+        return f"{value / 3600:.1f} 小时"
+    if value >= 60:
+        return f"{value / 60:.0f} 分钟"
+    return f"{value:.0f} 秒"
+
+
+def _chart_color(tag: str, *, soft: bool = False) -> QColor:
+    foreground, background = tag_tone_colors(tag_tone(tag))
+    return QColor(background if soft else foreground)
+
+
+class TagDonutChart(QWidget):
+    """Small interactive donut chart for today's tag allocation."""
+
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self._values: dict[str, float] = {}
+        self._total = 0.0
+        self._hovered_tag: str | None = None
+        self.setMinimumSize(220, 220)
+        self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        self.setMouseTracking(True)
+        self.setAccessibleName("今日标签时间环状图")
+        self.setAccessibleDescription("展示今天各标签 Waiting Task 的专注时间分布")
+
+    def sizeHint(self) -> QSize:
+        return QSize(280, 240)
+
+    def set_values(self, values: dict[str, float]) -> None:
+        self._values = {
+            str(tag): max(0.0, float(seconds))
+            for tag, seconds in values.items()
+            if float(seconds) > 0
+        }
+        self._values = dict(
+            sorted(self._values.items(), key=lambda item: (-item[1], item[0]))
+        )
+        self._total = sum(self._values.values())
+        self._hovered_tag = None
+        self.setToolTip("")
+        self.update()
+
+    def _chart_rect(self) -> QRectF:
+        side = max(0.0, float(min(self.width(), self.height()) - 30))
+        return QRectF(
+            (self.width() - side) / 2,
+            (self.height() - side) / 2,
+            side,
+            side,
+        )
+
+    def _tag_at(self, point: QPointF) -> str | None:
+        if self._total <= 0:
+            return None
+        rect = self._chart_rect()
+        center = rect.center()
+        dx = point.x() - center.x()
+        dy = point.y() - center.y()
+        radius = math.hypot(dx, dy)
+        outer = rect.width() / 2
+        inner = outer * 0.53
+        if radius < inner or radius > outer:
+            return None
+        angle = math.degrees(math.atan2(-dy, dx)) % 360
+        relative = (90 - angle) % 360
+        cursor = 0.0
+        items = list(self._values.items())
+        for index, (tag, seconds) in enumerate(items):
+            span = 360 * seconds / self._total
+            if relative < cursor + span or index == len(items) - 1:
+                return tag
+            cursor += span
+        return None
+
+    def paintEvent(self, _event: object) -> None:  # noqa: N802
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        if self._total <= 0:
+            painter.setPen(QColor(COLORS["muted"]))
+            painter.drawText(self.rect(), Qt.AlignmentFlag.AlignCenter, "今天暂无等待时间")
+            painter.end()
+            return
+
+        rect = self._chart_rect()
+        start = 90.0
+        painter.setPen(Qt.PenStyle.NoPen)
+        for tag, seconds in self._values.items():
+            span = -360 * seconds / self._total
+            color = _chart_color(tag)
+            if tag == self._hovered_tag:
+                color = color.lighter(118)
+            painter.setBrush(color)
+            painter.drawPie(rect, int(start * 16), int(span * 16))
+            start += span
+
+        outer = rect.width() / 2
+        hole = outer * 0.53
+        center = rect.center()
+        hole_rect = QRectF(
+            center.x() - hole,
+            center.y() - hole,
+            hole * 2,
+            hole * 2,
+        )
+        painter.setBrush(QColor(COLORS["cream"]))
+        painter.drawEllipse(hole_rect)
+        font = QFont(self.font())
+        font.setBold(True)
+        font.setPointSize(15)
+        painter.setFont(font)
+        painter.setPen(QColor(COLORS["ink"]))
+        painter.drawText(
+            hole_rect.adjusted(-18, -12, 18, 12),
+            Qt.AlignmentFlag.AlignCenter,
+            format_duration(self._total),
+        )
+        painter.end()
+
+    def mouseMoveEvent(self, event: QMouseEvent) -> None:  # noqa: N802
+        tag = self._tag_at(event.position())
+        if tag != self._hovered_tag:
+            self._hovered_tag = tag
+            self.update()
+        if tag is None:
+            self.setToolTip("")
+        else:
+            seconds = self._values[tag]
+            percentage = seconds / self._total * 100 if self._total else 0
+            self.setToolTip(
+                f"{tag}\n{_chart_duration(seconds)} · {percentage:.1f}%"
+            )
+        super().mouseMoveEvent(event)
+
+    def leaveEvent(self, event: object) -> None:  # noqa: N802
+        self._hovered_tag = None
+        self.setToolTip("")
+        self.update()
+        super().leaveEvent(event)  # type: ignore[arg-type]
+
+
+class DailyTagStackedChart(QWidget):
+    """Stacked daily tag totals for the selected local week or month."""
+
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self._period = "week"
+        self._buckets: list[TagTimeBucket] = []
+        self._hovered_index = -1
+        self.setMinimumHeight(250)
+        self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        self.setMouseTracking(True)
+        self.setAccessibleName("按天标签时长堆叠柱状图")
+        self.setAccessibleDescription("展示本周或本月每天各标签的 Waiting Task 专注时间")
+
+    def sizeHint(self) -> QSize:
+        return QSize(680, 290)
+
+    def set_data(self, period: str, buckets: list[TagTimeBucket]) -> None:
+        self._period = period
+        self._buckets = list(buckets)
+        self._hovered_index = -1
+        self.setToolTip("")
+        self.update()
+
+    def _plot_rect(self) -> QRectF:
+        return QRectF(
+            54,
+            16,
+            max(0.0, float(self.width() - 72)),
+            max(0.0, float(self.height() - 60)),
+        )
+
+    def _tags(self) -> list[str]:
+        totals: dict[str, float] = {}
+        for bucket in self._buckets:
+            for tag, seconds in bucket.tag_seconds.items():
+                totals[tag] = totals.get(tag, 0.0) + seconds
+        return [
+            tag
+            for tag, _seconds in sorted(
+                totals.items(), key=lambda item: (-item[1], item[0])
+            )
+        ]
+
+    @staticmethod
+    def _bucket_total(bucket: TagTimeBucket) -> float:
+        return sum(bucket.tag_seconds.values())
+
+    def _tooltip_for(self, index: int) -> str:
+        bucket = self._buckets[index]
+        date_label = bucket.start.strftime("%Y-%m-%d")
+        lines = [f"{date_label} · {_chart_duration(self._bucket_total(bucket))}"]
+        for tag, seconds in sorted(
+            bucket.tag_seconds.items(), key=lambda item: (-item[1], item[0])
+        ):
+            if seconds > 0:
+                lines.append(f"{tag}：{_chart_duration(seconds)}")
+        return "\n".join(lines)
+
+    def paintEvent(self, _event: object) -> None:  # noqa: N802
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        plot = self._plot_rect()
+        totals = [self._bucket_total(bucket) for bucket in self._buckets]
+        maximum = max(totals, default=0.0)
+        if not self._buckets or maximum <= 0:
+            painter.setPen(QColor(COLORS["muted"]))
+            painter.drawText(
+                self.rect(),
+                Qt.AlignmentFlag.AlignCenter,
+                "所选周期暂无等待时间",
+            )
+            painter.end()
+            return
+
+        painter.setFont(QFont(self.font()))
+        tick_count = 4
+        for tick in range(tick_count + 1):
+            value = maximum * tick / tick_count
+            y = plot.bottom() - plot.height() * tick / tick_count
+            painter.setPen(QPen(QColor(COLORS["line"]), 1))
+            painter.drawLine(plot.left(), y, plot.right(), y)
+            painter.setPen(QColor(COLORS["muted"]))
+            painter.drawText(
+                QRectF(0, y - 9, plot.left() - 8, 18),
+                Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter,
+                _chart_duration(value),
+            )
+
+        tags = self._tags()
+        step = plot.width() / len(self._buckets)
+        bar_width = max(4.0, min(36.0, step * 0.72))
+        for index, bucket in enumerate(self._buckets):
+            x = plot.left() + index * step + (step - bar_width) / 2
+            bottom = plot.bottom()
+            for tag in tags:
+                seconds = bucket.tag_seconds.get(tag, 0.0)
+                if seconds <= 0:
+                    continue
+                height = plot.height() * seconds / maximum
+                painter.setPen(Qt.PenStyle.NoPen)
+                painter.setBrush(_chart_color(tag))
+                painter.drawRect(QRectF(x, bottom - height, bar_width, height))
+                bottom -= height
+
+            if index == self._hovered_index:
+                painter.setPen(QPen(QColor(COLORS["ink"]), 1))
+                painter.setBrush(Qt.BrushStyle.NoBrush)
+                painter.drawRect(QRectF(x, plot.top(), bar_width, plot.height()))
+
+            if (
+                self._period == "week"
+                or index == 0
+                or index == len(self._buckets) - 1
+                or index % 5 == 0
+            ):
+                label = bucket.start.strftime("%m/%d")
+                painter.setPen(QColor(COLORS["muted"]))
+                painter.drawText(
+                    QRectF(x - 14, plot.bottom() + 7, bar_width + 28, 20),
+                    Qt.AlignmentFlag.AlignCenter,
+                    label,
+                )
+        painter.end()
+
+    def mouseMoveEvent(self, event: QMouseEvent) -> None:  # noqa: N802
+        if not self._buckets:
+            return
+        plot = self._plot_rect()
+        if not plot.contains(event.position()):
+            index = -1
+        else:
+            step = plot.width() / len(self._buckets)
+            index = int((event.position().x() - plot.left()) / step)
+            if index < 0 or index >= len(self._buckets):
+                index = -1
+        if index != self._hovered_index:
+            self._hovered_index = index
+            self.update()
+        self.setToolTip(self._tooltip_for(index) if index >= 0 else "")
+        super().mouseMoveEvent(event)
+
+    def leaveEvent(self, event: object) -> None:  # noqa: N802
+        self._hovered_index = -1
+        self.setToolTip("")
+        self.update()
+        super().leaveEvent(event)  # type: ignore[arg-type]
+
+
 class StatisticsDialog(QDialog):
-    """Compact local statistics view for Waiting Task focus time."""
+    """Visual statistics view for today's allocation and daily trends."""
 
     def __init__(self, service: WaitLabService, parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self.service = service
         self.setWindowTitle("WaitLAB · 统计")
-        self.setMinimumSize(560, 500)
+        self.setMinimumSize(720, 700)
+        self.resize(780, 760)
         self.setWindowIcon(app_icon())
         self.setStyleSheet(_dialog_stylesheet())
         layout = QVBoxLayout(self)
@@ -1215,52 +1552,111 @@ class StatisticsDialog(QDialog):
         subtitle.setWordWrap(True)
         layout.addWidget(title)
         layout.addWidget(subtitle)
-        self.period_rows: dict[str, QLabel] = {}
-        for key, label in (("day", "今天"), ("week", "本周"), ("month", "本月")):
-            row = QFrame()
-            row.setObjectName("statRow")
-            row_layout = QHBoxLayout(row)
-            row_layout.setContentsMargins(12, 9, 12, 9)
-            row_layout.addWidget(QLabel(label))
-            value = QLabel()
-            value.setObjectName("statValue")
-            value.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
-            row_layout.addWidget(value)
-            self.period_rows[key] = value
-            layout.addWidget(row)
-        tag_title = QLabel("Waiting Task 标签时长")
-        tag_title.setObjectName("sectionTitle")
-        layout.addWidget(tag_title)
-        self.tag_list = QListWidget()
-        self.tag_list.setMinimumHeight(130)
-        layout.addWidget(self.tag_list, 1)
+
+        today_header = QHBoxLayout()
+        today_title = QLabel("今日标签分布")
+        today_title.setObjectName("sectionTitle")
+        today_header.addWidget(today_title)
+        today_header.addStretch(1)
+        self.today_total_label = QLabel()
+        self.today_total_label.setObjectName("statValue")
+        today_header.addWidget(self.today_total_label)
+        layout.addLayout(today_header)
+
+        today_content = QHBoxLayout()
+        today_content.setSpacing(18)
+        self.today_donut = TagDonutChart()
+        today_content.addWidget(self.today_donut, 1)
+        self.today_legend = QLabel()
+        self.today_legend.setObjectName("chartLegend")
+        self.today_legend.setWordWrap(True)
+        self.today_legend.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
+        self.today_legend.setMinimumWidth(230)
+        self.today_legend.setAccessibleName("今日标签时间明细")
+        today_content.addWidget(self.today_legend, 1)
+        layout.addLayout(today_content)
+
+        series_header = QHBoxLayout()
+        series_title = QLabel("按天标签时长")
+        series_title.setObjectName("sectionTitle")
+        series_header.addWidget(series_title)
+        series_header.addStretch(1)
+        self.series_total_label = QLabel()
+        self.series_total_label.setObjectName("statValue")
+        series_header.addWidget(self.series_total_label)
+        self.week_button = QPushButton("本周")
+        self.week_button.setObjectName("periodButton")
+        self.week_button.setCheckable(True)
+        self.week_button.clicked.connect(lambda: self._set_period("week"))
+        self.month_button = QPushButton("本月")
+        self.month_button.setObjectName("periodButton")
+        self.month_button.setCheckable(True)
+        self.month_button.clicked.connect(lambda: self._set_period("month"))
+        series_header.addWidget(self.week_button)
+        series_header.addWidget(self.month_button)
+        layout.addLayout(series_header)
+
+        self.series_chart = DailyTagStackedChart()
+        layout.addWidget(self.series_chart, 1)
+        self.series_legend = QLabel()
+        self.series_legend.setObjectName("chartLegend")
+        self.series_legend.setWordWrap(True)
+        self.series_legend.setAccessibleName("按天标签图例")
+        layout.addWidget(self.series_legend)
+
+        self._period = "week"
+        self.week_button.setChecked(True)
         close_button = QPushButton("关闭")
         close_button.clicked.connect(self.accept)
         layout.addWidget(close_button, 0, Qt.AlignmentFlag.AlignRight)
         self.refresh()
 
     def refresh(self) -> None:
-        for period, value in self.period_rows.items():
-            snapshot = self.service.stats_cache.get(period)
-            value.setText(format_duration(snapshot.waiting_seconds))
-        self.tag_list.clear()
-        tag_totals = {
-            period: self.service.stats_cache.get(period).tag_seconds
-            for period in ("day", "week", "month")
+        day_snapshot = self.service.stats_cache.get("day")
+        self.today_total_label.setText(format_duration(day_snapshot.waiting_seconds))
+        self.today_donut.set_values(day_snapshot.tag_seconds)
+        self.today_legend.setText(self._legend_html(day_snapshot.tag_seconds))
+        self._refresh_series()
+
+    def _set_period(self, period: str) -> None:
+        self._period = period
+        self.week_button.setChecked(period == "week")
+        self.month_button.setChecked(period == "month")
+        self._refresh_series()
+
+    def _refresh_series(self) -> None:
+        buckets = self.service.storage.tag_waiting_daily_series(self._period)
+        self.series_chart.set_data(self._period, buckets)
+        totals: dict[str, float] = {}
+        for bucket in buckets:
+            for tag, seconds in bucket.tag_seconds.items():
+                totals[tag] = totals.get(tag, 0.0) + seconds
+        total_seconds = sum(totals.values())
+        period_label = "本周" if self._period == "week" else "本月"
+        self.series_total_label.setText(
+            f"{period_label} {format_duration(total_seconds)}"
+        )
+        self.series_legend.setText(self._legend_html(totals))
+
+    @staticmethod
+    def _legend_html(values: dict[str, float]) -> str:
+        positive = {
+            tag: seconds for tag, seconds in values.items() if seconds > 0
         }
-        all_tags = sorted({tag for values in tag_totals.values() for tag in values})
-        if not all_tags:
-            item = QListWidgetItem("今天还没有完成的 Waiting Task 记录")
-            item.setFlags(Qt.ItemFlag.NoItemFlags)
-            self.tag_list.addItem(item)
-        else:
-            self.tag_list.addItem("标签                 今天       本周       本月")
-            for tag in all_tags:
-                self.tag_list.addItem(
-                    f"{tag}    {format_duration(tag_totals['day'].get(tag, 0))}  "
-                    f"{format_duration(tag_totals['week'].get(tag, 0))}  "
-                    f"{format_duration(tag_totals['month'].get(tag, 0))}"
-                )
+        if not positive:
+            return "暂无标签记录"
+        total = sum(positive.values())
+        parts = []
+        for tag, seconds in sorted(
+            positive.items(), key=lambda item: (-item[1], item[0])
+        ):
+            foreground, _background = tag_tone_colors(tag_tone(tag))
+            percentage = seconds / total * 100 if total else 0
+            parts.append(
+                f'<span style="color:{foreground};">●</span> '
+                f"{escape(tag)}  {format_duration(seconds)} ({percentage:.1f}%)"
+            )
+        return "　".join(parts)
 
 
 class SettingsDialog(QDialog):
@@ -1399,6 +1795,7 @@ class PetWindow(QWidget):
         self._native_topmost_enabled = True
         self._next_native_topmost_sync = 0.0
         self._suggestion_signature: tuple[tuple[int | None, str, str, str], ...] | None = None
+        self._suggestion_mode: str | None = None
         self._paused_signature: tuple[tuple[int, str, str, int], ...] | None = None
         self._completed_signature: tuple[tuple[int | None, str, float, int, str], ...] | None = None
         self.completion_banner_until = 0.0
@@ -1429,6 +1826,7 @@ class PetWindow(QWidget):
         self.cookie_state_machine = CookieStateMachine()
         self._focus_full_title = ""
         self._state_full_title = ""
+        self._fit_to_content_pending = False
 
         self.setWindowTitle("WaitLAB")
         self.setWindowIcon(app_icon())
@@ -1661,9 +2059,7 @@ class PetWindow(QWidget):
         self.quick_task_tag.setObjectName("quickTaskTag")
         self.quick_task_tag.set_compact(True)
         self.quick_task_tag.setToolTip("为新任务选择标签")
-        self.quick_task_tag.geometry_changed.connect(
-            lambda: QTimer.singleShot(0, self._fit_to_content)
-        )
+        self.quick_task_tag.geometry_changed.connect(self._schedule_fit_to_content)
         add_quick = QPushButton("新增")
         add_quick.clicked.connect(self._add_quick_task)
         add_row.addWidget(quick_tag_label)
@@ -2331,7 +2727,7 @@ class PetWindow(QWidget):
         self._update_connection_status()
         self.card.layout().invalidate()
         self.card.layout().activate()
-        QTimer.singleShot(0, self._fit_to_content)
+        self._schedule_fit_to_content()
         if (
             self.isVisible()
             and self._native_topmost_enabled
@@ -2340,6 +2736,18 @@ class PetWindow(QWidget):
             self._next_native_topmost_sync = time.monotonic() + 1.5
             self._apply_native_topmost()
 
+    def _schedule_fit_to_content(self) -> None:
+        """Coalesce layout fitting requests from refresh and chip geometry."""
+
+        if self._fit_to_content_pending:
+            return
+        self._fit_to_content_pending = True
+        QTimer.singleShot(0, self._run_scheduled_fit_to_content)
+
+    def _run_scheduled_fit_to_content(self) -> None:
+        self._fit_to_content_pending = False
+        self._fit_to_content()
+
     def _fit_to_content(self) -> None:
         # Presentation-mode stylesheet changes can restore Qt's default
         # button metrics; reapply the compact home selector after polishing.
@@ -2347,7 +2755,9 @@ class PetWindow(QWidget):
         self.quick_task_tag.sync_height()
         self.card.layout().invalidate()
         self.card.layout().activate()
-        self.setFixedHeight(self.card.sizeHint().height() + 16)
+        target_height = self.card.sizeHint().height() + 16
+        if self.height() != target_height:
+            self.setFixedHeight(target_height)
 
     def _elide_focus_title(self) -> None:
         if not self._focus_full_title:
@@ -2441,7 +2851,7 @@ class PetWindow(QWidget):
         QTimer.singleShot(0, self._apply_native_topmost)
         self.card.layout().invalidate()
         self.card.layout().activate()
-        QTimer.singleShot(0, self._fit_to_content)
+        self._schedule_fit_to_content()
         QTimer.singleShot(0, self._keep_on_screen)
 
     def _update_connection_status(self, force: bool = False) -> None:
@@ -2643,7 +3053,16 @@ class PetWindow(QWidget):
         self.today_completed_list.setMaximumHeight(target)
 
     def _continue_completed_task(self, summary: CompletedTaskSummary) -> None:
-        if self.service.focus is not None:
+        if self.service.has_active_focus():
+            self.apply_update(
+                self.service.pause_focus(message="褰撳墠浠诲姟宸叉殏鍋滐紝姝ｅ湪鍒囨崲浠诲姟")
+            )
+            self.start_focus(Task(summary.task_id, summary.title, summary.kind, 0, summary.tag))
+            return
+        if self.service.focus is not None and self.service.has_active_focus():
+            self.apply_update(
+                self.service.pause_focus(message="褰撳墠浠诲姟宸叉殏鍋滐紝姝ｅ湪鍒囨崲浠诲姟")
+            )
             self.last_message = "请先完成或暂停当前微任务"
             self.refresh()
             return
@@ -2663,7 +3082,7 @@ class PetWindow(QWidget):
             item.setSizeHint(QSize(0, row.sizeHint().height()))
         self._update_completed_list_height()
         self.today_completed_list.updateGeometry()
-        QTimer.singleShot(0, self._fit_to_content)
+        self._schedule_fit_to_content()
 
     def _delete_completed_record(self, record_id: int) -> None:
         record = self.service.storage.get_completed_focus_record(record_id)
@@ -2723,20 +3142,43 @@ class PetWindow(QWidget):
 
     def _refresh_suggestions(self) -> None:
         manual = self.service.storage.list_manual_tasks()
-        # Manual tasks are always the first-class queue.  The fixed cycle is a
-        # fallback only when that queue is empty, matching the service's
-        # selection semantics and keeping the picker easy to scan.
-        all_tasks = manual if manual else self.service.suggested_tasks()
+        switching = self.service.focus is not None and self.service.focus.is_paused
+        # Avoid parsing the fixed-cycle settings on every idle refresh when
+        # manual tasks already determine the home picker's contents.  The
+        # switcher still loads them alongside manual tasks.
+        fixed_cycle = (
+            self.service.fixed_cycle_tasks() if switching or not manual else []
+        )
         paused = self.service.paused_focuses()
         paused_keys = {
             (session.task.id, session.task.kind, session.task.title)
             for session in paused
         }
-        tasks = [
-            task
-            for task in all_tasks
-            if (task.id, task.kind, task.title) not in paused_keys
-        ]
+
+        def available(candidates: list[Task]) -> list[Task]:
+            return [
+                task
+                for task in candidates
+                if (task.id, task.kind, task.title) not in paused_keys
+            ]
+
+        # The home picker keeps the original priority rule: manual tasks are
+        # shown first, and fixed-cycle tasks are the fallback when no manual
+        # task exists.  Once a task is paused for switching, both queues are
+        # useful and must be visible so the user can move between them.
+        if switching:
+            groups = [
+                ("我的具体任务", available(manual)),
+                ("固定循环候选", available(fixed_cycle)),
+            ]
+            source_mode = "switcher"
+        else:
+            candidates = manual if manual else fixed_cycle
+            groups = [
+                ("我的具体任务" if manual else "固定循环候选", available(candidates))
+            ]
+            source_mode = "manual" if manual else "fixed"
+        tasks = [task for _title, group in groups for task in group]
         signature = tuple((task.id, task.title, task.kind.value, task.tag) for task in tasks)
         paused_signature = tuple(
             (
@@ -2751,7 +3193,7 @@ class PetWindow(QWidget):
         self.random_task_button.setVisible(not manual and bool(tasks))
         self.picker_source.setText(
             "切换任务"
-            if self.service.focus is not None and self.service.focus.is_paused
+            if switching
             else "我的具体任务"
             if manual
             else "固定循环任务"
@@ -2759,9 +3201,11 @@ class PetWindow(QWidget):
         if (
             signature == self._suggestion_signature
             and paused_signature == self._paused_signature
+            and source_mode == self._suggestion_mode
         ):
             return
         self._suggestion_signature = signature
+        self._suggestion_mode = source_mode
         self._paused_signature = paused_signature
         while self.suggestion_layout.count():
             item = self.suggestion_layout.takeAt(0)
@@ -2792,15 +3236,22 @@ class PetWindow(QWidget):
             configure.clicked.connect(self.open_task_manager)
             self.suggestion_layout.addWidget(configure)
             return
-        section = QLabel("我的具体任务" if manual else "固定循环候选")
-        section.setObjectName("muted")
-        self.suggestion_layout.addWidget(section)
-        for index, task in enumerate(tasks, start=1):
-            button = QPushButton(f"{index} · {task.title}  ·  {task.tag}")
-            button.setObjectName("taskButton")
-            button.setCursor(Qt.CursorShape.PointingHandCursor)
-            button.clicked.connect(lambda _checked=False, selected=task: self.start_focus(selected))
-            self.suggestion_layout.addWidget(button)
+        index = 1
+        for section_title, section_tasks in groups:
+            if not section_tasks:
+                continue
+            section = QLabel(section_title)
+            section.setObjectName("muted")
+            self.suggestion_layout.addWidget(section)
+            for task in section_tasks:
+                button = QPushButton(f"{index} · {task.title}  ·  {task.tag}")
+                button.setObjectName("taskButton")
+                button.setCursor(Qt.CursorShape.PointingHandCursor)
+                button.clicked.connect(
+                    lambda _checked=False, selected=task: self.start_focus(selected)
+                )
+                self.suggestion_layout.addWidget(button)
+                index += 1
         self.suggestion_layout.invalidate()
         self.suggestion_container.updateGeometry()
         self.picker.layout().invalidate()
@@ -2836,6 +3287,10 @@ class PetWindow(QWidget):
         self.start_focus(task)
 
     def start_focus(self, task: Task) -> None:
+        if self.service.has_active_focus():
+            self.apply_update(
+                self.service.pause_focus(message="褰撳墠浠诲姟宸叉殏鍋滐紝姝ｅ湪鍒囨崲浠诲姟")
+            )
         if self.service.has_active_focus():
             self.last_message = "请先暂停当前微任务，再切换任务"
             self.refresh()
@@ -3376,6 +3831,12 @@ def _window_stylesheet() -> str:
         background: {COLORS['white']}; border: 1px solid {COLORS['line']}; border-radius: 10px;
     }}
     QLabel#statValue {{ color: {COLORS['mint_dark']}; font-family: 'Cascadia Mono'; font-weight: 700; }}
+    QLabel#chartLegend {{ color: {COLORS['muted']}; font-size: 11px; line-height: 1.35; }}
+    QPushButton#periodButton {{ padding: 5px 11px; font-size: 10px; }}
+    QPushButton#periodButton:checked {{
+        color: {COLORS['mint_dark']}; background: #DDF1E9; border-color: #BFE4D6;
+        font-weight: 700;
+    }}
     QLabel#completedTitle {{ font-size: 11px; font-weight: 650; }}
     QLabel#completedMeta {{ color: {COLORS['muted']}; font-size: 9px; }}
     QLabel#completedDuration {{
@@ -3465,4 +3926,3 @@ def _dialog_stylesheet() -> str:
     }}
     QPushButton#primaryButton {{ color: white; background: {COLORS['mint_dark']}; border-color: {COLORS['mint_dark']}; }}
     """
-

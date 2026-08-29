@@ -13,6 +13,7 @@ from .models import (
     DEFAULT_TAG,
     FocusOutcome,
     FocusSession,
+    TagTimeBucket,
     Task,
     TaskKind,
     from_iso,
@@ -1505,9 +1506,15 @@ class Storage:
             total += max(0.0, wall - paused) * (overlap / wall if wall else 0.0)
         return total
 
-    def tag_waiting_seconds(self, period: str, now: datetime | None = None) -> dict[str, float]:
-        window_start, window_end = self._period_window(period, now)
-        current = now or utc_now()
+    def _tag_waiting_seconds_for_windows(
+        self,
+        windows: list[tuple[datetime, datetime]],
+        current: datetime,
+    ) -> list[dict[str, float]]:
+        """Aggregate tag time for one or more UTC windows in one DB pass."""
+
+        totals: list[dict[str, float]] = [{} for _ in windows]
+        current_utc = current.astimezone(timezone.utc)
         segment_rows = self._connection.execute(
             """
             SELECT s.started_at, s.ended_at, f.task_tag
@@ -1516,17 +1523,25 @@ class Storage:
             WHERE f.outcome IN ('completed', 'abandoned') OR f.ended_at IS NULL
             """
         ).fetchall()
-        totals: dict[str, float] = {}
         for row in segment_rows:
             started = from_iso(row["started_at"])
-            ended = from_iso(row["ended_at"]) or current
+            ended = from_iso(row["ended_at"]) or current_utc
             if started is None or ended is None:
                 continue
-            duration = self._overlap_seconds(started, ended, window_start, window_end)
             tag = self.normalize_tag(row["task_tag"])
-            totals[tag] = totals.get(tag, 0.0) + duration
+            for index, (window_start, window_end) in enumerate(windows):
+                duration = self._overlap_seconds(
+                    started,
+                    ended,
+                    window_start,
+                    window_end,
+                )
+                if duration > 0:
+                    totals[index][tag] = totals[index].get(tag, 0.0) + duration
 
-        # Legacy fallback mirrors waiting_seconds above.
+        # Legacy fallback mirrors waiting_seconds above.  Old sessions do not
+        # have pause segments, so their active time is distributed
+        # proportionally over the overlapping calendar windows.
         rows = self._connection.execute(
             """
             SELECT f.started_at, f.ended_at, f.paused_seconds, f.paused_at, f.task_tag
@@ -1538,18 +1553,74 @@ class Storage:
         ).fetchall()
         for row in rows:
             started = from_iso(row["started_at"])
-            ended = from_iso(row["ended_at"]) or current
+            ended = from_iso(row["ended_at"]) or current_utc
             if started is None or ended is None:
                 continue
             wall = max(0.0, (ended - started).total_seconds())
-            overlap = self._overlap_seconds(started, ended, window_start, window_end)
+            if wall <= 0:
+                continue
             paused = float(row["paused_seconds"] or 0.0)
             if row["ended_at"] is None and row["paused_at"]:
-                paused += max(0.0, (current - (from_iso(row["paused_at"]) or current)).total_seconds())
-            duration = max(0.0, wall - paused) * (overlap / wall if wall else 0.0)
+                paused += max(
+                    0.0,
+                    (
+                        current_utc
+                        - (from_iso(row["paused_at"]) or current_utc)
+                    ).total_seconds(),
+                )
+            active = max(0.0, wall - paused)
+            if active <= 0:
+                continue
             tag = self.normalize_tag(row["task_tag"])
-            totals[tag] = totals.get(tag, 0.0) + duration
+            for index, (window_start, window_end) in enumerate(windows):
+                overlap = self._overlap_seconds(
+                    started,
+                    ended,
+                    window_start,
+                    window_end,
+                )
+                if overlap > 0:
+                    duration = active * (overlap / wall)
+                    totals[index][tag] = totals[index].get(tag, 0.0) + duration
+        return totals
+
+    def tag_waiting_seconds(self, period: str, now: datetime | None = None) -> dict[str, float]:
+        window_start, window_end = self._period_window(period, now)
+        current = now or utc_now()
+        totals = self._tag_waiting_seconds_for_windows(
+            [(window_start, window_end)],
+            current,
+        )[0]
         return dict(sorted(totals.items(), key=lambda item: (-item[1], item[0])))
+
+    def tag_waiting_daily_series(
+        self,
+        period: str,
+        now: datetime | None = None,
+    ) -> list[TagTimeBucket]:
+        """Return per-day tag totals for the current local week or month."""
+
+        if period not in {"week", "month"}:
+            raise ValueError("daily tag series only supports week or month")
+        current = (now or datetime.now().astimezone()).astimezone()
+        period_start, period_end = self._period_window(period, current)
+        local_start = period_start.astimezone(current.tzinfo)
+        local_end = period_end.astimezone(current.tzinfo)
+        buckets: list[tuple[datetime, datetime]] = []
+        cursor = local_start
+        while cursor < local_end:
+            next_cursor = min(cursor + timedelta(days=1), local_end)
+            buckets.append((cursor, next_cursor))
+            cursor = next_cursor
+        windows = [
+            (start.astimezone(timezone.utc), end.astimezone(timezone.utc))
+            for start, end in buckets
+        ]
+        totals = self._tag_waiting_seconds_for_windows(windows, current)
+        return [
+            TagTimeBucket(start, end, dict(sorted(day.items())))
+            for (start, end), day in zip(buckets, totals)
+        ]
 
     def today_completed_titles(self, now: datetime | None = None) -> list[str]:
         """Backward-compatible title-only view of today's completed tasks."""
@@ -1572,4 +1643,3 @@ class Storage:
     def set_setting(self, key: str, value: str) -> None:
         self._set_setting_uncommitted(key, value)
         self._connection.commit()
-

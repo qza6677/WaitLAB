@@ -7,7 +7,7 @@ from .desktop_activity import (
     COMPLETED_STATUSES,
     DesktopTurnSnapshot,
 )
-from .models import AiSession, FocusOutcome, FocusSession, ServiceUpdate, Task, utc_now
+from .models import AiSession, FocusOutcome, FocusSession, ServiceUpdate, Task, TaskKind, utc_now
 from .storage import Storage
 from .stats_cache import StatsCache
 
@@ -65,6 +65,21 @@ class WaitLabService:
 
     def suggested_tasks(self) -> list[Task]:
         return self.storage.suggested_tasks(limit=3)
+
+    def fixed_cycle_tasks(self, limit: int = 3) -> list[Task]:
+        """Return enabled fixed-cycle tasks without applying manual-task fallback.
+
+        The home picker intentionally prefers manual tasks whenever any exist,
+        but the task switcher must still be able to offer the fixed-cycle queue
+        while a manual task is running.  Keeping this distinction in the
+        service avoids duplicating the default-task conversion in the UI.
+        """
+
+        entries = [entry for entry in self.storage.default_task_entries() if entry.enabled]
+        return [
+            Task(None, entry.title, TaskKind.DEFAULT, offset, entry.tag)
+            for offset, entry in enumerate(entries[:limit])
+        ]
 
     def has_active_focus(self) -> bool:
         """Return whether the selected focus session is counting time."""
@@ -460,4 +475,3 @@ class WaitLabService:
             return ServiceUpdate(message="当前没有正在等待的 Codex 任务")
         self.storage.skip_ai_picker(open_ai.turn_id)
         return ServiceUpdate(message="本轮已跳过；新的 Codex 任务仍会提醒")
-

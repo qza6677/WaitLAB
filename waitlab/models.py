@@ -97,6 +97,15 @@ class CompletedFocusRecord:
     duration_seconds: float
 
 
+@dataclass(frozen=True, slots=True)
+class TagTimeBucket:
+    """Waiting Task time accumulated by tag within one local calendar day."""
+
+    start: datetime
+    end: datetime
+    tag_seconds: dict[str, float]
+
+
 @dataclass(slots=True)
 class AiSession:
     id: int
@@ -137,4 +146,3 @@ class ServiceUpdate:
     # an event source, while Waiting Task is the only timed activity.
     ai_turn_id: str | None = None
     ai_status: str | None = None
-

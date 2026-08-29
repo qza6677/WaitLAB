@@ -7,7 +7,7 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: "Release version, for example v0.5.14"
+        description: "Release version, for example v0.5.15"
         required: true
         type: string
 
@@ -85,4 +85,3 @@ jobs:
               --title "WaitLAB $tag" `
               --generate-notes
           }
-
