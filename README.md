@@ -54,7 +54,7 @@ python run_waitlab.py
 已经构建好的文件位于 `release`：
 
 - `WaitLAB.exe`：本次本地验证用的单文件便携版，无需安装。
-- `WaitLAB-Setup-0.5.14.exe`：若构建环境安装了 Inno Setup 6，则会额外生成简体中文安装器。
+- `WaitLAB-Setup-0.5.15.exe`：若构建环境安装了 Inno Setup 6，则会额外生成简体中文安装器。
 
 默认的 Waiting Task 任务和标签面向通用的工作、学习、编码与整理场景；升级旧版本时，已有自定义任务、历史记录和旧标签会继续保留。
 
@@ -77,7 +77,7 @@ python run_waitlab.py
 WaitLAB 默认以只读方式检查 Codex 桌面端维护的本机任务状态库：
 
 ```text
-%USERPROFILE%\.codex\thread_history_1.sqlite
+Codex 桌面端维护的本机状态数据库（具体路径由 Codex 管理）
 ```
 
 它只查询 `thread_id`、`turn_id`、`status`、`started_at` 和 `completed_at`，不会查询消息、任务标题、工作目录、错误详情或 item JSON。连接成功后，桌宠顶部会显示 Codex 活动状态；该状态只在 WaitLAB 运行期间有效，不会累计 Codex 时长。
@@ -191,4 +191,3 @@ hook_bridge.py         隐私过滤后的 Codex hook 桥接
 build_release.ps1      Windows 便携版与安装器构建脚本
 packaging/             图标、版本信息和 Inno Setup 配置
 ```
-
