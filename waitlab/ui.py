@@ -169,13 +169,26 @@ class PetFace(QWidget):
         self._dragging = False
         self._timer = QTimer(self)
         self._timer.timeout.connect(self._animate)
-        self._timer.start(90)
+        self._animated_states = {
+            CookieState.WAITING,
+            CookieState.ATTENTION,
+            CookieState.ERROR,
+        }
         self._transition = QVariantAnimation(self)
         self._transition.setDuration(180)
         self._transition.setEasingCurve(QEasingCurve.Type.InOutCubic)
         self._transition.valueChanged.connect(self._on_transition_value)
         self._transition.finished.connect(self._finish_transition)
         self.set_state(CookieState.IDLE)
+
+    def _sync_animation_timer(self) -> None:
+        """Animate only states that visibly use the bobbing phase."""
+
+        should_run = self.cookie_state in self._animated_states
+        if should_run and not self._timer.isActive():
+            self._timer.start(90)
+        elif not should_run and self._timer.isActive():
+            self._timer.stop()
 
     def set_size(self, size: int) -> None:
         next_size = max(48, min(160, int(size)))
@@ -202,6 +215,7 @@ class PetFace(QWidget):
         previous_pixmap = self._cookie_pixmap
         self.cookie_state = next_state
         self.mode = self.cookie_state.value
+        self._sync_animation_timer()
         path = self.assets.path_for(self.cookie_state, self._display_size)
         next_pixmap = QPixmap(str(path)) if path is not None else QPixmap()
         self._transition.stop()
@@ -1831,6 +1845,7 @@ class PetWindow(QWidget):
         self._focus_full_title = ""
         self._state_full_title = ""
         self._fit_to_content_pending = False
+        self._last_calendar_day = time.localtime()[:3]
 
         self.setWindowTitle("WaitLAB")
         self.setWindowIcon(app_icon())
@@ -1848,11 +1863,10 @@ class PetWindow(QWidget):
         self._restore_position()
 
         self.timer = QTimer(self)
-        self.timer.timeout.connect(self.refresh)
-        # The worker thread handles Codex polling independently.  UI refresh
-        # only needs to update labels/countdowns once per second; the Cookie
-        # animation has its own timer, so a 250 ms full-widget refresh only
-        # caused needless database reads and layout work.
+        self.timer.timeout.connect(self._tick)
+        # The worker thread handles Codex polling independently.  The regular
+        # timer only advances visible clocks and expires transient notices;
+        # data/layout refreshes are driven by actual state changes.
         self.timer.start(1000)
         self.refresh()
         # Qt widget tests run in an isolated/offline process. Do not start a
@@ -2373,7 +2387,7 @@ class PetWindow(QWidget):
         available: bool,
         error: str | None,
         database: Path,
-    ) -> None:
+    ) -> bool:
         changed = (
             self._desktop_source_available != available
             or self._desktop_source_error != error
@@ -2389,6 +2403,7 @@ class PetWindow(QWidget):
             self._desktop_unavailable_since = time.monotonic()
         if changed:
             self._update_connection_status(force=True)
+        return changed
 
     def _desktop_source_is_unknown(self) -> bool:
         """Return whether a lost desktop source invalidates active rows."""
@@ -2728,13 +2743,7 @@ class PetWindow(QWidget):
         if self._state_full_title:
             QTimer.singleShot(0, self._elide_state_title)
 
-        day_stats = self.service.stats_cache.get("day")
-        minutes = int(day_stats.waiting_seconds // 60)
-        self.today_label.setText(f"今日回收 {minutes} 分钟")
-        self.home_stats_label.setText(
-            "今天 · Waiting Task "
-            f"{format_duration(day_stats.waiting_seconds)}"
-        )
+        self._update_today_stats()
         self._update_connection_status()
         self.card.layout().invalidate()
         self.card.layout().activate()
@@ -2746,6 +2755,52 @@ class PetWindow(QWidget):
         ):
             self._next_native_topmost_sync = time.monotonic() + 1.5
             self._apply_native_topmost()
+
+    def _update_today_stats(self) -> None:
+        """Refresh the two compact daily totals shown on the home page."""
+
+        day_stats = self.service.stats_cache.get("day")
+        minutes = int(day_stats.waiting_seconds // 60)
+        self.today_label.setText(f"\u4eca\u65e5\u56de\u6536 {minutes} \u5206\u949f")
+        self.home_stats_label.setText(
+            "\u4eca\u5929 \u00b7 Waiting Task "
+            f"{format_duration(day_stats.waiting_seconds)}"
+        )
+
+    def _tick(self) -> None:
+        """Update elapsed labels without re-querying storage or rebuilding UI."""
+
+        now = time.monotonic()
+        calendar_day = time.localtime()[:3]
+        calendar_day_changed = calendar_day != self._last_calendar_day
+        if calendar_day_changed:
+            self._last_calendar_day = calendar_day
+        transient_expired = (
+            bool(self._notice_body)
+            and now >= self._notice_until
+        ) or (
+            self._deleted_history_record is not None
+            and now >= self._deleted_history_until
+        )
+        focus = self.service.focus
+        if focus is not None:
+            elapsed_text = format_duration(focus.elapsed_seconds())
+            self.focus_time.setText(elapsed_text)
+            self.compact_timer_label.setText(elapsed_text)
+            if not calendar_day_changed:
+                self._update_today_stats()
+        desktop_unknown_due = (
+            self._desktop_unavailable_since is not None
+            and bool(self._desktop_turn_ids)
+            and now - self._desktop_unavailable_since >= DESKTOP_SOURCE_GRACE_SECONDS
+            and not self._desktop_unknown_notice_shown
+        )
+        if calendar_day_changed or transient_expired or desktop_unknown_due or (
+            self._active_completion_turn_id is None
+            and self._completion_queue
+            and not self._notice_is_visible()
+        ):
+            self.refresh()
 
     def _schedule_fit_to_content(self) -> None:
         """Coalesce layout fitting requests from refresh and chip geometry."""

@@ -1,6 +1,6 @@
 [project]
 name = "waitlab"
-version = "0.5.15"
+version = "0.5.16"
 description = "A local Windows waiting assistant that turns Codex wait time into focused microtasks."
 requires-python = ">=3.11"
 dependencies = [

@@ -48,20 +48,43 @@ class WaitLabService:
         # sessions can remain paused for quick task switching.  Older
         # versions only loaded the newest open session; loading all sessions
         # here lets a switched task survive a restart as well.
+        selected_focus_id = self._read_focus_id(storage.get_setting("active_focus_id", ""))
+        running_before_recovery = storage.get_running_focus()
         open_focuses = storage.list_open_focuses()
         for session in open_focuses:
             if not session.is_paused:
                 self.storage.recover_open_focus(session)
         open_focuses = storage.list_open_focuses()
-        self.focus: FocusSession | None = open_focuses[-1] if open_focuses else None
+        selected = next(
+            (session for session in open_focuses if session.id == selected_focus_id),
+            None,
+        )
+        if selected is None and running_before_recovery is not None:
+            selected = next(
+                (session for session in open_focuses if session.id == running_before_recovery.id),
+                None,
+            )
+        self.focus: FocusSession | None = selected or (open_focuses[-1] if open_focuses else None)
         self._paused_focuses: dict[int, FocusSession] = {
             session.id: session
-            for session in open_focuses[:-1]
-            if session.is_paused
+            for session in open_focuses
+            if self.focus is None or session.id != self.focus.id
         }
+        self._persist_focus_selection(self.focus)
         self.has_recovered_focus = bool(open_focuses)
         self.last_ai_completion_seconds: float | None = None
         self.last_ai_terminal_status: str | None = None
+
+    @staticmethod
+    def _read_focus_id(value: str) -> int | None:
+        try:
+            focus_id = int(str(value).strip())
+        except (TypeError, ValueError):
+            return None
+        return focus_id if focus_id > 0 else None
+
+    def _persist_focus_selection(self, focus: FocusSession | None) -> None:
+        self.storage.set_setting("active_focus_id", str(focus.id) if focus is not None else "")
 
     def suggested_tasks(self) -> list[Task]:
         return self.storage.suggested_tasks(limit=3)
@@ -400,6 +423,7 @@ class WaitLabService:
                 self._paused_focuses[self.focus.id] = self.focus
             self.focus = self.storage.start_focus(task, when=current)
             message = f"开始：{task.title}"
+        self._persist_focus_selection(self.focus)
         self.stats_cache.invalidate()
         return ServiceUpdate(focus_changed=True, message=message)
 
@@ -420,6 +444,7 @@ class WaitLabService:
         current = when or utc_now()
         self.focus.paused_at = current
         self.focus.last_heartbeat_at = current
+        self._persist_focus_selection(self.focus)
         self.storage.save_focus_pause(self.focus)
         self.stats_cache.invalidate()
         return ServiceUpdate(focus_changed=True, message=message)
@@ -433,6 +458,7 @@ class WaitLabService:
             return ServiceUpdate()
         current = when or utc_now()
         self._resume_focus_session(self.focus, current)
+        self._persist_focus_selection(self.focus)
         self._paused_focuses.pop(self.focus.id, None)
         self.stats_cache.invalidate()
         return ServiceUpdate(focus_changed=True, message=message)
@@ -447,6 +473,7 @@ class WaitLabService:
         completed = self.focus
         self.storage.finish_focus_and_task(completed, FocusOutcome.COMPLETED, when=when)
         self.stats_cache.invalidate()
+        self._persist_focus_selection(None)
         self.focus = None
         return ServiceUpdate(focus_changed=True, message="微任务完成，做得漂亮")
 
@@ -456,6 +483,7 @@ class WaitLabService:
         abandoned = self.focus
         self.storage.finish_focus_and_task(abandoned, FocusOutcome.ABANDONED, when=when)
         self.stats_cache.invalidate()
+        self._persist_focus_selection(None)
         self.focus = None
         return ServiceUpdate(focus_changed=True, message="任务已放回任务池")
 

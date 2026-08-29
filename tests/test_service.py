@@ -397,6 +397,32 @@ def test_switched_paused_focuses_are_restored_after_restart(tmp_path):
         second_storage.close()
 
 
+def test_selected_running_focus_is_restored_over_newer_paused_focus(tmp_path):
+    path = tmp_path / "waitlab.db"
+    first_storage = Storage(path)
+    first_service = WaitLabService(first_storage)
+    first = first_storage.add_manual_task("鎭㈠鏃惰閫夌殑浠诲姟")
+    second = first_storage.add_manual_task("鏂板缓浠诲姟")
+    first_service.start_focus(first, when=moment())
+    first_service.pause_focus(when=moment(2))
+    first_service.start_focus(second, when=moment(3))
+    first_service.pause_focus(when=moment(4))
+    first_service.start_focus(first, when=moment(5))
+    first_storage.close()
+
+    second_storage = Storage(path)
+    second_service = WaitLabService(second_storage)
+    try:
+        assert second_service.focus is not None
+        assert second_service.focus.task.id == first.id
+        assert second_service.focus.is_paused is True
+        assert [session.task.id for session in second_service.paused_focuses()] == [
+            second.id,
+            first.id,
+        ]
+    finally:
+        second_storage.close()
+
 def test_manual_task_is_removed_after_focus_completion(service):
     task = service.storage.add_manual_task("补充方法部分")
     service.start_focus(task, when=moment())

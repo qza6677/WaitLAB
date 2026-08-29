@@ -970,6 +970,46 @@ class Storage:
                 )
         return len(open_sessions)
 
+    def purge_ai_sessions(
+        self,
+        max_age_days: int = 30,
+        max_rows: int = 500,
+        now: datetime | None = None,
+    ) -> int:
+        """Prune old Codex lifecycle rows while retaining recent diagnostics."""
+
+        age_days = max(1, int(max_age_days))
+        keep_rows = max(1, int(max_rows))
+        cutoff = (now or utc_now()) - timedelta(days=age_days)
+        with self._connection:
+            before = int(
+                self._connection.execute(
+                    "SELECT COUNT(*) FROM ai_sessions WHERE ended_at IS NOT NULL"
+                ).fetchone()[0]
+            )
+            self._connection.execute(
+                """
+                DELETE FROM ai_sessions
+                WHERE ended_at IS NOT NULL
+                  AND (
+                    ended_at < ?
+                    OR id NOT IN (
+                        SELECT id FROM ai_sessions
+                        WHERE ended_at IS NOT NULL
+                        ORDER BY ended_at DESC, id DESC
+                        LIMIT ?
+                    )
+                  )
+                """,
+                (to_iso(cutoff), keep_rows),
+            )
+            after = int(
+                self._connection.execute(
+                    "SELECT COUNT(*) FROM ai_sessions WHERE ended_at IS NOT NULL"
+                ).fetchone()[0]
+            )
+        return max(0, before - after)
+
     def get_ai_session(self, turn_id: str) -> AiSession | None:
         row = self._connection.execute(
             "SELECT * FROM ai_sessions WHERE turn_id = ? ORDER BY id DESC LIMIT 1",

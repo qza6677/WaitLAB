@@ -54,7 +54,7 @@ python run_waitlab.py
 已经构建好的文件位于 `release`：
 
 - `WaitLAB.exe`：本次本地验证用的单文件便携版，无需安装。
-- `WaitLAB-Setup-0.5.15.exe`：若构建环境安装了 Inno Setup 6，则会额外生成简体中文安装器。
+- `WaitLAB-Setup-0.5.16.exe`：若构建环境安装了 Inno Setup 6，则会额外生成简体中文安装器。
 
 默认的 Waiting Task 任务和标签面向通用的工作、学习、编码与整理场景；升级旧版本时，已有自定义任务、历史记录和旧标签会继续保留。
 

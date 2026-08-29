@@ -207,8 +207,6 @@ class DesktopActivityReader:
         uri = f"file:{self.database.resolve().as_posix()}?mode=ro"
         with sqlite3.connect(uri, uri=True, timeout=0.25) as connection:
             connection.execute("PRAGMA query_only=ON")
-            cutoff = self._now() - self.lookback
-            cutoff_epoch = cutoff.timestamp()
             latest_row_id = int(
                 connection.execute(
                     "SELECT COALESCE(MAX(rowid), 0) FROM thread_turns"
@@ -216,93 +214,108 @@ class DesktopActivityReader:
             )
             known_keys = list(self._known_statuses)
             key_clause = ""
-            fallback_key_clause = ""
             key_params: list[object] = []
             if known_keys:
                 key_clause = " OR " + " OR ".join(
                     "(t.thread_id = ? AND t.turn_id = ?)" for _ in known_keys
                 )
-                fallback_key_clause = " OR " + " OR ".join(
-                    "(thread_id = ? AND turn_id = ?)" for _ in known_keys
-                )
                 for thread_id, turn_id in known_keys:
                     key_params.extend((thread_id, turn_id))
-            try:
-                raw_rows = connection.execute(
-                    f"""
-                    SELECT
-                        t.rowid AS row_id,
-                        t.thread_id,
-                        t.turn_id,
-                        t.status,
-                        t.started_at,
-                        t.completed_at,
-                        MAX(i.created_at_ms) AS last_activity_ms
-                    FROM thread_turns AS t
-                    LEFT JOIN thread_items AS i
-                      ON i.thread_id = t.thread_id AND i.turn_id = t.turn_id
-                    WHERE (
-                        t.rowid > ?
-                        OR t.started_at >= ?
-                        OR lower(t.status) IN ('inprogress', 'running', 'needsattention', 'needsinput', 'needsapproval', 'waitingforinput', 'waitingforapproval')
-                        {key_clause}
-                    )
-                    GROUP BY t.thread_id, t.turn_id, t.status, t.started_at, t.completed_at
-                    ORDER BY t.started_at DESC
-                    LIMIT ?
-                    """,
-                    (self._last_row_id, cutoff_epoch, *key_params, self.max_rows),
-                ).fetchall()
-            except sqlite3.OperationalError:
-                # Older test fixtures and early Codex databases may not have
-                # the item projection yet.  Lifecycle status remains useful;
-                # stale detection simply stays conservative for those rows.
-                raw_rows = connection.execute(
-                    f"""
-                    SELECT rowid AS row_id, thread_id, turn_id, status, started_at, completed_at
-                    FROM thread_turns
-                    WHERE (
-                        rowid > ?
-                        OR started_at >= ?
-                        OR lower(status) IN ('inprogress', 'running', 'needsattention', 'needsinput', 'needsapproval', 'waitingforinput', 'waitingforapproval')
-                        {fallback_key_clause}
-                    )
-                    ORDER BY started_at DESC
-                    LIMIT ?
-                    """,
-                    (self._last_row_id, cutoff_epoch, *key_params, self.max_rows),
-                ).fetchall()
+
+            # The first poll seeds a bounded recent snapshot. Subsequent polls
+            # are incremental: new rowids plus currently tracked lifecycle
+            # rows. This avoids rescanning every recent terminal turn.
+            if not self._initialized:
+                cutoff_epoch = (self._now() - self.lookback).timestamp()
+                where_clause = (
+                    "(t.started_at >= ? OR lower(t.status) IN "
+                    "('inprogress', 'running', 'needsattention', 'needsinput', "
+                    "'needsapproval', 'waitingforinput', 'waitingforapproval')"
+                    f"{key_clause})"
+                )
+                query_params: list[object] = [cutoff_epoch, *key_params, self.max_rows]
+            else:
+                where_clause = (
+                    "(t.rowid > ? OR lower(t.status) IN "
+                    "('inprogress', 'running', 'needsattention', 'needsinput', "
+                    "'needsapproval', 'waitingforinput', 'waitingforapproval')"
+                    f"{key_clause})"
+                )
+                query_params = [self._last_row_id, *key_params, self.max_rows]
+
+            raw_rows = connection.execute(
+                f"""
+                SELECT rowid AS row_id, thread_id, turn_id, status, started_at, completed_at
+                FROM thread_turns AS t
+                WHERE {where_clause}
+                ORDER BY t.started_at DESC, t.rowid DESC
+                LIMIT ?
+                """,
+                query_params,
+            ).fetchall()
+
+            # Item contents are never read. We only ask for timestamps for
+            # active rows, and only after the cheap lifecycle query found them.
+            item_activity: dict[tuple[str, str], int | float] = {}
+            active_keys = [
+                (str(row[1]), str(row[2]))
+                for row in raw_rows
+                if _normal_status(str(row[3]))
+                in RUNNING_STATUSES | ATTENTION_STATUSES
+            ]
+            if active_keys:
+                item_clause = " OR ".join(
+                    "(thread_id = ? AND turn_id = ?)" for _ in active_keys
+                )
+                item_params: list[object] = []
+                for thread_id, turn_id in active_keys:
+                    item_params.extend((thread_id, turn_id))
+                try:
+                    item_rows = connection.execute(
+                        f"""
+                        SELECT thread_id, turn_id, MAX(created_at_ms)
+                        FROM thread_items
+                        WHERE {item_clause}
+                        GROUP BY thread_id, turn_id
+                        """,
+                        item_params,
+                    ).fetchall()
+                except sqlite3.OperationalError:
+                    # Older Codex databases may not expose thread_items.
+                    item_rows = []
+                item_activity = {
+                    (str(row[0]), str(row[1])): row[2]
+                    for row in item_rows
+                    if row[2] is not None
+                }
 
         rows: list[_TurnRow] = []
-        max_row_id = self._last_row_id
         for raw_row in raw_rows:
-            if len(raw_row) == 7:
-                row_id, thread_id, turn_id, status, started_at, completed_at, last_activity_ms = raw_row
-                max_row_id = max(max_row_id, int(row_id))
-            elif len(raw_row) == 6:
+            if len(raw_row) == 6:
                 row_id, thread_id, turn_id, status, started_at, completed_at = raw_row
-                max_row_id = max(max_row_id, int(row_id))
-                last_activity_ms = None
             else:
                 thread_id, turn_id, status, started_at, completed_at = raw_row
-                last_activity_ms = None
+                row_id = None
+            if row_id is not None:
+                self._last_row_id = max(self._last_row_id, int(row_id))
             parsed_started_at = _from_epoch(started_at)
             if parsed_started_at is None:
                 continue
+            key = (str(thread_id), str(turn_id))
             rows.append(
                 _TurnRow(
-                    thread_id=str(thread_id),
-                    turn_id=str(turn_id),
+                    thread_id=key[0],
+                    turn_id=key[1],
                     status=str(status),
                     started_at=parsed_started_at,
                     completed_at=_from_epoch(completed_at),
-                    last_activity_at=_from_epoch(last_activity_ms),
+                    last_activity_at=_from_epoch(item_activity.get(key)),
                 )
             )
         # Advance the watermark to the database head, not merely the last row
-        # in the bounded result set.  Otherwise a large recent history would
-        # be selected repeatedly on every poll even though no new rows exist.
-        self._last_row_id = max(self._last_row_id, max_row_id, latest_row_id)
+        # in the bounded result set. This prevents a large initial history from
+        # being selected repeatedly on every poll.
+        self._last_row_id = max(self._last_row_id, latest_row_id)
         return rows
 
     @staticmethod
@@ -349,6 +362,9 @@ class DesktopActivityWorker(QObject):
         super().__init__()
         self.reader = reader
         self.interval_ms = max(250, int(interval_ms))
+        # Idle Codex periods do not need sub-second polling. Return to the
+        # fast interval as soon as an active/attention turn is observed.
+        self.idle_interval_ms = max(self.interval_ms, self.interval_ms * 2)
         self._timer: QTimer | None = None
         self.stop_requested.connect(self.stop)
 
@@ -361,12 +377,21 @@ class DesktopActivityWorker(QObject):
 
     def poll_once(self) -> None:
         events = self.reader.poll()
+        snapshots = self.reader.status_snapshot()
+        if self._timer is not None:
+            active = any(
+                _normal_status(snapshot.status) in RUNNING_STATUSES | ATTENTION_STATUSES
+                for snapshot in snapshots
+            )
+            target_interval = self.interval_ms if active else self.idle_interval_ms
+            if self._timer.interval() != target_interval:
+                self._timer.setInterval(target_interval)
         self.poll_ready.emit(
             events,
             self.reader.available,
             self.reader.error,
             self.reader.database,
-            self.reader.status_snapshot(),
+            snapshots,
         )
 
     def stop(self) -> None:

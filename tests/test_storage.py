@@ -322,3 +322,22 @@ def test_expired_history_archives_are_purged_with_segments(tmp_path):
         ).fetchone() is None
     finally:
         storage.close()
+
+def test_ai_lifecycle_rows_are_retained_with_age_and_count_limits(tmp_path):
+    storage = Storage(tmp_path / "waitlab.db", track_ai_time=False)
+    try:
+        now = datetime(2026, 8, 30, 12, 0, tzinfo=timezone.utc)
+        storage.start_ai_session("thread", "old", when=now - timedelta(days=40))
+        storage.finish_ai_session("old", when=now - timedelta(days=40) + timedelta(minutes=1))
+        for index in range(3):
+            turn_id = f"recent-{index}"
+            storage.start_ai_session("thread", turn_id, when=now - timedelta(days=index))
+            storage.finish_ai_session(turn_id, when=now - timedelta(days=index) + timedelta(minutes=1))
+
+        assert storage.purge_ai_sessions(max_age_days=30, max_rows=2, now=now) == 2
+        rows = storage._connection.execute(
+            "SELECT turn_id FROM ai_sessions ORDER BY ended_at DESC"
+        ).fetchall()
+        assert [row["turn_id"] for row in rows] == ["recent-0", "recent-1"]
+    finally:
+        storage.close()

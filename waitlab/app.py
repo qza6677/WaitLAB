@@ -46,10 +46,12 @@ class DesktopActivityReceiver(QObject):
         snapshots: object,
     ) -> None:
         source_path = database if isinstance(database, Path) else database_path()
-        self.window.set_desktop_source_status(
-            bool(available),
-            str(error) if error else None,
-            source_path,
+        source_changed = bool(
+            self.window.set_desktop_source_status(
+                bool(available),
+                str(error) if error else None,
+                source_path,
+            )
         )
         if isinstance(snapshots, tuple):
             self.window.set_desktop_snapshots(snapshots)
@@ -58,11 +60,24 @@ class DesktopActivityReceiver(QObject):
         if bool(available):
             # Reconcile terminal/stale rows even when WaitLAB missed the
             # original transition while it was closed or restarting.
-            self.window.apply_update(
-                self.service.reconcile_desktop_sessions(
-                    snapshots if isinstance(snapshots, tuple) else ()
-                )
+            reconciliation = self.service.reconcile_desktop_sessions(
+                snapshots if isinstance(snapshots, tuple) else ()
             )
+            has_effect = any((
+                reconciliation.show_task_picker,
+                reconciliation.ai_completed,
+                reconciliation.ai_blocked,
+                reconciliation.ai_needs_attention,
+                reconciliation.ai_resumed,
+                reconciliation.focus_changed,
+                reconciliation.message is not None,
+            ))
+            if has_effect:
+                self.window.apply_update(reconciliation)
+            elif source_changed:
+                self.window.refresh()
+        elif source_changed:
+            self.window.refresh()
 
 
 def main() -> int:
@@ -98,6 +113,12 @@ def main() -> int:
             # Retention maintenance is best-effort and must not prevent the
             # main app from opening a usable database.
             logger.exception("Unable to purge deleted focus archives")
+        try:
+            purged_ai = storage.purge_ai_sessions()
+            if purged_ai:
+                logger.info("Purged %d expired Codex lifecycle rows", purged_ai)
+        except Exception:
+            logger.exception("Unable to purge Codex lifecycle rows")
     except Exception as exc:
         logger.exception("Unable to open local database: %s", database)
         backup = None
@@ -196,6 +217,7 @@ def main() -> int:
         desktop_thread.wait(2000)
         power_monitor.close()
         hotkeys.close()
+        window.update_manager.shutdown(join_timeout=2.0)
         tray.hide()
         storage.close()
         instance_lock.unlock()
