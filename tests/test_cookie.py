@@ -90,4 +90,3 @@ def test_cookie_state_machine_marks_terminal_error():
     assert resolve_cookie_state(
         CookieContext(completion_visible=True, terminal_error=True)
     ) is CookieState.ERROR
-

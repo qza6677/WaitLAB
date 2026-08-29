@@ -72,4 +72,3 @@ jobs:
           if ($portable.VersionInfo.FileVersion -ne $version) {
             throw "Portable package version $($portable.VersionInfo.FileVersion) does not match source version $version."
           }
-

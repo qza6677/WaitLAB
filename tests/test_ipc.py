@@ -21,4 +21,3 @@ def test_ipc_sanitizes_lifecycle_payload_and_rejects_bad_fields():
     }
     assert HookEventServer.sanitize_payload({"event": "Unknown"}) is None
     assert HookEventServer.sanitize_payload({"event": "Stop", "turn_id": 12}) is None
-

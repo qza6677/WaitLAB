@@ -529,4 +529,3 @@ def test_existing_database_is_migrated_with_picker_skipped_column(tmp_path):
     assert "active_seconds" in columns
     assert "running_since" in columns
     storage.close()
-

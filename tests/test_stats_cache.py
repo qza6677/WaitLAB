@@ -40,4 +40,3 @@ def test_stats_cache_can_be_invalidated() -> None:
     cache.get("week")
 
     assert storage.calls.count(("codex", "week")) == 2
-

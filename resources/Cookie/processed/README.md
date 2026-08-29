@@ -25,4 +25,3 @@ States are in row-major order:
 12. `updating` — update in progress
 
 The original file in the parent directory is not overwritten.
-

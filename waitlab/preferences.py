@@ -101,4 +101,3 @@ class Preferences:
             return False
         current = now or datetime.now().time()
         return start <= current < end if start <= end else current >= start or current < end
-

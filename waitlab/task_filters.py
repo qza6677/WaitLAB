@@ -27,4 +27,3 @@ def filter_and_sort_tasks(
     elif sort_mode == "标签":
         filtered.sort(key=lambda task: (task.tag.casefold(), task.title.casefold()))
     return filtered
-

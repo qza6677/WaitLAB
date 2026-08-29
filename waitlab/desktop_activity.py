@@ -375,4 +375,3 @@ class DesktopActivityWorker(QObject):
         thread = self.thread()
         if thread is not None:
             thread.quit()
-

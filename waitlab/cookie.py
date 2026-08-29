@@ -166,4 +166,3 @@ class CookieAssets:
 
     def available(self) -> bool:
         return self.path_for(CookieState.IDLE) is not None
-

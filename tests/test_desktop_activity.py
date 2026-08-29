@@ -184,4 +184,3 @@ def test_status_snapshot_reads_item_timestamp_without_item_contents(tmp_path):
     assert snapshot.turn_id == "turn-1"
     assert snapshot.last_activity_at is not None
     assert snapshot.last_activity_at.timestamp() == 1_787_700_123
-

@@ -68,4 +68,3 @@ class UpdateManager:
 
         Thread(target=worker, daemon=True, name="waitlab-update-download").start()
         return True
-

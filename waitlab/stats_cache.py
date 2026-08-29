@@ -67,4 +67,3 @@ class StatsCache:
         )
         self._cache[period] = (current, bucket, snapshot)
         return snapshot
-

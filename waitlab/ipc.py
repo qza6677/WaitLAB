@@ -71,4 +71,3 @@ class HookEventServer(QObject):
             "session_id": session_id.strip() if isinstance(session_id, str) else None,
             "turn_id": turn_id.strip() if isinstance(turn_id, str) else None,
         }
-

@@ -12,4 +12,3 @@ def test_task_filter_and_sort_is_case_insensitive_and_tag_aware() -> None:
     result = filter_and_sort_tasks(tasks, query="写", tag="论文写作", sort_mode="名称 A-Z")
 
     assert [task.title for task in result] == ["写 Discussion", "写摘要"]
-

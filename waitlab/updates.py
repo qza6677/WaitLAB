@@ -224,4 +224,3 @@ def cleanup_download_directory(path: Path, delay_seconds: float = 3.0) -> None:
                 time.sleep(1.0)
 
     Thread(target=worker, daemon=True, name="waitlab-update-cleanup").start()
-

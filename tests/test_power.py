@@ -25,4 +25,3 @@ def test_power_monitor_emits_one_suspend_and_keeps_resume_explicit():
 
     assert events == ["suspended", "resumed"]
     monitor.close()
-

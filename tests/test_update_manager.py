@@ -28,4 +28,3 @@ def test_update_manager_deduplicates_checks(monkeypatch) -> None:
         time.sleep(0.05)
     assert results == [release]
     assert manager.check_busy is False
-

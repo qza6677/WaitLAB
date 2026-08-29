@@ -95,4 +95,3 @@ def test_verified_download_rejects_non_executable_payload(monkeypatch):
     monkeypatch.setattr(updates, "_download_to_file", fake_download)
     with pytest.raises(ValueError, match="Windows"):
         updates.download_verified_installer(release)
-

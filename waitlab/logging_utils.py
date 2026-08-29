@@ -39,4 +39,3 @@ def configure_logging(data_directory: Path) -> logging.Logger:
             # Logging must never prevent the desktop app from starting.
             logger.addHandler(logging.NullHandler())
     return logger
-

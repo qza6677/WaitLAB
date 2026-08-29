@@ -25,4 +25,3 @@ def test_hidden_page_keeps_active_task_in_compact_player():
 def test_notice_opens_a_bubble_without_requiring_a_task():
     assert choose_presentation_mode(False, False, notice_open=True) is PresentationMode.NOTICE
     assert choose_presentation_mode(True, False, notice_open=True) is PresentationMode.PLAYER
-

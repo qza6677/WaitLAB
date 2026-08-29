@@ -59,4 +59,3 @@ def test_packaged_autostart_command_only_uses_executable(tmp_path):
     executable.write_text("", encoding="utf-8")
 
     assert autostart_command(executable, frozen=True) == f'"{executable.resolve()}"'
-
