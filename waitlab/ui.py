@@ -1464,7 +1464,10 @@ class DailyTagStackedChart(QWidget):
             value = maximum * tick / tick_count
             y = plot.bottom() - plot.height() * tick / tick_count
             painter.setPen(QPen(QColor(COLORS["line"]), 1))
-            painter.drawLine(plot.left(), y, plot.right(), y)
+            painter.drawLine(
+                QPointF(plot.left(), y),
+                QPointF(plot.right(), y),
+            )
             painter.setPen(QColor(COLORS["muted"]))
             painter.drawText(
                 QRectF(0, y - 9, plot.left() - 8, 18),
