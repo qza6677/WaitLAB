@@ -37,7 +37,9 @@ class HookEventServer(QObject):
                 continue
             datagram = self.socket.receiveDatagram()
             try:
-                payload = json.loads(bytes(datagram.data()).decode("utf-8"))
+                # PySide6's QByteArray is bytes-compatible at runtime, but
+                # its generated stub omits that protocol on some wheels.
+                payload = json.loads(bytes(datagram.data()).decode("utf-8"))  # type: ignore[arg-type]
             except (UnicodeDecodeError, json.JSONDecodeError):
                 continue
             sanitized = self.sanitize_payload(payload)
