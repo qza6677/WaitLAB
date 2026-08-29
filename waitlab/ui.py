@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+import os
 import random
 import time
 import hashlib
@@ -1851,7 +1852,14 @@ class PetWindow(QWidget):
         # caused needless database reads and layout work.
         self.timer.start(1000)
         self.refresh()
-        if Preferences.load(self.service.storage).auto_check_updates:
+        # Qt widget tests run in an isolated/offline process. Do not start a
+        # background HTTPS updater from that process: the network worker can
+        # outlive the test widget and has caused intermittent Windows
+        # Python/SSL access violations while the Qt event loop is shutting
+        # down. Normal desktop runs keep the user's automatic update setting.
+        auto_check_updates = Preferences.load(self.service.storage).auto_check_updates
+        running_under_pytest = bool(os.environ.get("PYTEST_CURRENT_TEST"))
+        if auto_check_updates and not running_under_pytest:
             QTimer.singleShot(3500, lambda: self.check_for_updates(silent=True))
 
     def _build_ui(self) -> None:
