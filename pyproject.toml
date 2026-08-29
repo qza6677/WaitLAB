@@ -17,3 +17,19 @@ pythonpath = ["."]
 [tool.mypy]
 ignore_missing_imports = true
 
+# PySide6's generated stubs expose several Qt APIs differently across Python
+# and wheel versions (for example QCoreApplication.instance() and QLayout).
+# Keep strict checking for the data/service layers while limiting the known
+# adapter-only false positives to the modules that directly wrap Qt.
+[[tool.mypy.overrides]]
+module = ["waitlab.power", "waitlab.hotkeys"]
+disable_error_code = ["union-attr"]
+
+[[tool.mypy.overrides]]
+module = ["waitlab.ipc"]
+disable_error_code = ["arg-type"]
+
+[[tool.mypy.overrides]]
+module = ["waitlab.ui"]
+disable_error_code = ["arg-type", "attr-defined", "name-defined", "override", "union-attr"]
+
