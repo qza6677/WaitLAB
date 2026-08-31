@@ -43,7 +43,16 @@ jobs:
         run: ruff check waitlab tests
 
       - name: Check types
-        run: python -m mypy --config-file pyproject.toml --no-incremental waitlab
+        shell: pwsh
+        run: |
+          $output = @(& python -m mypy --config-file pyproject.toml --no-incremental waitlab 2>&1)
+          $exitCode = $LASTEXITCODE
+          if ($exitCode -ne 0) {
+            foreach ($line in $output) {
+              Write-Output "::error title=mypy::$($line.ToString())"
+            }
+            throw "mypy failed with exit code $exitCode."
+          }
 
       - name: Build Windows release
         shell: pwsh
