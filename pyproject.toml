@@ -18,10 +18,11 @@ filterwarnings = ["error::ResourceWarning"]
 [tool.mypy]
 ignore_missing_imports = true
 
-# PySide6's generated stubs expose several Qt APIs differently across Python
-# and wheel versions (for example QCoreApplication.instance() and QLayout).
-# Keep strict checking for the data/service layers while limiting the known
-# adapter-only false positives to the modules that directly wrap Qt.
+# PySide6's generated stubs expose several Qt APIs differently across Python,
+# operating-system, and wheel versions (for example QCoreApplication.instance,
+# QSizePolicy.Expanding, Qt.Orientations, and QLayout.takeAt). Keep strict
+# checking for the data/service layers while limiting known adapter-only false
+# positives to modules that directly wrap Qt.
 [[tool.mypy.overrides]]
 module = ["waitlab.power", "waitlab.hotkeys"]
 disable_error_code = ["union-attr"]
@@ -33,3 +34,7 @@ disable_error_code = ["arg-type"]
 [[tool.mypy.overrides]]
 module = ["waitlab.ui"]
 disable_error_code = ["arg-type", "attr-defined", "name-defined", "override", "union-attr"]
+
+[[tool.mypy.overrides]]
+module = ["waitlab.ui_widgets", "waitlab.ui_charts"]
+disable_error_code = ["arg-type", "attr-defined", "name-defined", "override"]
