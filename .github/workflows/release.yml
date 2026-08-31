@@ -43,7 +43,7 @@ jobs:
         run: ruff check waitlab tests
 
       - name: Check types
-        run: python -m mypy --no-incremental waitlab
+        run: python -m mypy --config-file pyproject.toml --no-incremental waitlab
 
       - name: Build Windows release
         shell: pwsh
