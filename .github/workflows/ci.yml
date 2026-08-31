@@ -39,7 +39,7 @@ jobs:
         run: ruff check waitlab tests
 
       - name: Check types
-        run: mypy waitlab
+        run: python -m mypy --no-incremental waitlab
 
   package:
     runs-on: windows-latest
