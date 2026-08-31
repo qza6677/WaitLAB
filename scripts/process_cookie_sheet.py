@@ -175,7 +175,6 @@ def paste_anchored(
         content_bbox = (0, 0, cell_rgba.width, cell_rgba.height)
 
     cat_x0, cat_y0, cat_x1, cat_y1 = cat_bbox
-    cat_width = max(1, cat_x1 - cat_x0)
     cat_height = max(1, cat_y1 - cat_y0)
     # Keep every state inside the common canvas, while making cat height as
     # consistent as possible.  The constraints are calculated around the cat

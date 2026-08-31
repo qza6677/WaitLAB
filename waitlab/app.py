@@ -9,6 +9,7 @@ from PySide6.QtCore import QLockFile, QObject, QThread, QTimer, Qt, Slot
 from PySide6.QtGui import QFont
 from PySide6.QtWidgets import QApplication, QMessageBox, QSystemTrayIcon
 
+from .app_composition import ApplicationContext
 from .desktop_activity import DesktopActivityReader, DesktopActivityWorker
 from .hotkeys import GlobalHotkeys
 from .ipc import HookEventServer
@@ -17,7 +18,6 @@ from .logging_utils import configure_logging
 from .paths import data_directory, database_path
 from .power import SystemPowerMonitor
 from .service import WaitLabService
-from .storage import Storage
 from .ui import PetWindow, app_icon, create_tray
 
 
@@ -104,7 +104,8 @@ def main() -> int:
         # Codex provides lifecycle events only; Waiting Task owns all user
         # facing timing. Keep legacy AI duration columns readable without
         # writing new Codex duration segments in the desktop application.
-        storage = Storage(database, track_ai_time=False)
+        context = ApplicationContext.open(database, track_ai_time=False)
+        storage = context.storage
         try:
             purged_archives = storage.purge_archived_focus_sessions()
             if purged_archives:
@@ -137,7 +138,7 @@ def main() -> int:
         )
         instance_lock.unlock()
         return 1
-    service = WaitLabService(storage)
+    service = context.service
     window = PetWindow(service)
 
     if not QSystemTrayIcon.isSystemTrayAvailable():
@@ -178,6 +179,21 @@ def main() -> int:
     heartbeat_timer.timeout.connect(service.heartbeat)
     heartbeat_timer.start()
 
+    maintenance_timer = QTimer(app)
+    maintenance_timer.setInterval(60 * 60 * 1000)
+
+    def run_maintenance() -> None:
+        try:
+            storage.purge_archived_focus_sessions()
+            storage.purge_ai_sessions()
+        except Exception:
+            # Retention is best-effort; a transient database lock must not
+            # interrupt the user's active Waiting Task.
+            logger.exception("Unable to run periodic retention maintenance")
+
+    maintenance_timer.timeout.connect(run_maintenance)
+    maintenance_timer.start()
+
     power_monitor = SystemPowerMonitor()
 
     def on_suspend() -> None:
@@ -213,13 +229,14 @@ def main() -> int:
         service.pause_focus(message="退出时已自动暂停")
         window.save_position()
         heartbeat_timer.stop()
+        maintenance_timer.stop()
         desktop_worker.stop_requested.emit()
         desktop_thread.wait(2000)
         power_monitor.close()
         hotkeys.close()
         window.update_manager.shutdown(join_timeout=2.0)
         tray.hide()
-        storage.close()
+        context.close()
         instance_lock.unlock()
         logger.info("WaitLAB stopped")
 

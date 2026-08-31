@@ -117,3 +117,16 @@ def test_bridge_ignores_unknown_hook_events():
         check=True,
     )
     assert result.stdout == '{"continue":true}'
+
+
+def test_bridge_forwards_optional_hook_token(monkeypatch):
+    monkeypatch.setenv("WAITLAB_HOOK_TOKEN", "local-secret")
+
+    # Import lazily so the subprocess-oriented tests above keep exercising
+    # the actual bridge entry point while this unit test checks token shaping.
+    import hook_bridge
+
+    payload = hook_bridge.sanitized_event({"hook_event_name": "Stop"})
+
+    assert payload is not None
+    assert payload["token"] == "local-secret"

@@ -61,6 +61,7 @@ try {
         --version-file $GeneratedVersionFile `
         --add-data "$CookieAssets;resources/Cookie/processed/sprites-96" `
         --add-data "$CookieAssetsHighRes;resources/Cookie/processed/sprites-256" `
+        --add-data "$(Join-Path $ProjectRoot 'pyproject.toml');." `
         --distpath $ReleaseDir `
         --workpath $BuildDir `
         --specpath (Join-Path $ProjectRoot 'build') `

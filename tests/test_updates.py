@@ -1,7 +1,26 @@
+import tomllib
+from pathlib import Path
+
 import pytest
 
 from waitlab import updates
-from waitlab.updates import ReleaseInfo, describe_update_error, version_tuple
+from waitlab.updates import (
+    ReleaseInfo,
+    cleanup_download_directory,
+    describe_update_error,
+    version_tuple,
+)
+
+
+def test_runtime_version_comes_from_project_metadata():
+    project = tomllib.loads(
+        (Path(updates.__file__).resolve().parents[1] / "pyproject.toml")
+        .read_text(encoding="utf-8")
+    )
+
+    from waitlab import __version__
+
+    assert __version__ == project["project"]["version"]
 
 
 def test_semantic_version_comparison_shape():
@@ -23,6 +42,12 @@ def test_update_error_describes_windows_timeout():
 
 def test_update_error_does_not_expose_empty_exception():
     assert describe_update_error(RuntimeError()) == "更新失败，请稍后再试。"
+
+
+def test_update_error_for_untrusted_installer_is_readable():
+    message = describe_update_error(ValueError("Release installer URL is not trusted"))
+
+    assert message == "更新文件格式或下载地址不可信。未安装本次更新。"
 
 
 def test_large_download_retries_after_transient_timeout(monkeypatch, tmp_path):
@@ -59,6 +84,41 @@ def test_large_download_retries_after_transient_timeout(monkeypatch, tmp_path):
 
     assert calls == 2
     assert target.read_bytes() == b"installer-bytes"
+
+
+def test_download_rejects_payload_over_configured_limit(monkeypatch, tmp_path):
+    class Response:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def read(self, _size=-1):
+            if self._sent:
+                return b""
+            self._sent = True
+            return b"123456"
+
+        _sent = False
+
+    monkeypatch.setattr(updates, "MAX_INSTALLER_BYTES", 5)
+    monkeypatch.setattr(updates, "urlopen", lambda *_args, **_kwargs: Response())
+    target = tmp_path / "WaitLAB-Setup-too-large.exe"
+
+    with pytest.raises(ValueError, match="大小限制"):
+        updates._download_to_file("https://example.invalid/installer", target, timeout=30)
+
+    assert not target.exists()
+
+
+def test_cleanup_ignores_directories_outside_updater_namespace(tmp_path):
+    target = tmp_path / "installer.exe"
+    target.write_bytes(b"installer")
+
+    cleanup_download_directory(target, delay_seconds=0)
+
+    assert target.exists()
 
 
 def test_release_assets_must_use_github_https_urls(monkeypatch):

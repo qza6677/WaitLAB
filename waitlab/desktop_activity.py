@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import sqlite3
+from contextlib import closing
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from enum import StrEnum
@@ -205,7 +206,10 @@ class DesktopActivityReader:
         if not self.database.is_file():
             raise FileNotFoundError(self.database)
         uri = f"file:{self.database.resolve().as_posix()}?mode=ro"
-        with sqlite3.connect(uri, uri=True, timeout=0.25) as connection:
+        # sqlite3.Connection's context manager only commits/rolls back; it
+        # does not close the connection. The reader polls repeatedly, so make
+        # the lifetime explicit to avoid leaking one handle per poll.
+        with closing(sqlite3.connect(uri, uri=True, timeout=0.25)) as connection:
             connection.execute("PRAGMA query_only=ON")
             latest_row_id = int(
                 connection.execute(

@@ -1,32 +1,40 @@
 from __future__ import annotations
 
+import random as random
 from datetime import datetime
 
 from .desktop_activity import (
-    BLOCKED_STATUSES,
-    COMPLETED_STATUSES,
+    BLOCKED_STATUSES as BLOCKED_STATUSES,
+    COMPLETED_STATUSES as COMPLETED_STATUSES,
     DesktopTurnSnapshot,
 )
-from .models import AiSession, FocusOutcome, FocusSession, ServiceUpdate, Task, TaskKind, utc_now
+from .models import (
+    AiSession,
+    CompletedFocusRecord,
+    CompletedTaskSummary,
+    DEFAULT_TAG,
+    DefaultTaskEntry,
+    FocusSession,
+    ServiceUpdate,
+    TagTimeBucket,
+    Task,
+    TaskKind,
+)
+from .preferences import Preferences
 from .storage import Storage
 from .stats_cache import StatsCache
-
-
-def _normal_status(status: str) -> str:
-    return "".join(character for character in status.casefold() if character.isalnum())
-
-
-AI_RUNNING_STATUSES = {"inprogress", "running"}
-AI_ATTENTION_STATUSES = {
-    "needsattention",
-    "needsinput",
-    "needsapproval",
-    "waitingforinput",
-    "waitingforapproval",
-}
-AI_STALE_AFTER_SECONDS = 5 * 60
-AI_MISSING_AFTER_SECONDS = 5 * 60
-AI_INITIAL_PROMPT_GRACE_SECONDS = 5 * 60
+from .service_focus import FocusCoordinator
+from .service_ai import AiCoordinator
+from .service_policy import (
+    AI_ATTENTION_STATUSES as AI_ATTENTION_STATUSES,
+    AI_INITIAL_PROMPT_GRACE_SECONDS as AI_INITIAL_PROMPT_GRACE_SECONDS,
+    AI_MISSING_AFTER_SECONDS as AI_MISSING_AFTER_SECONDS,
+    AI_RUNNING_STATUSES as AI_RUNNING_STATUSES,
+    AI_STALE_AFTER_SECONDS,
+    MAX_REMEMBERED_TURNS as MAX_REMEMBERED_TURNS,
+    STATS_CACHE_TTL_SECONDS,
+    normal_status as _normal_status,  # noqa: F401 - compatibility export
+)
 
 
 class WaitLabService:
@@ -37,125 +45,202 @@ class WaitLabService:
         # Waiting Task is the only user-facing timer. Codex activity is kept
         # as a short-lived lifecycle signal and is intentionally excluded
         # from periodic statistics queries.
-        self.stats_cache = StatsCache(storage, include_codex=False)
+        # The visible clock updates every second, but aggregate statistics do
+        # not need a database pass at that frequency. State-changing actions
+        # invalidate this cache immediately; the short TTL keeps the home
+        # summary fresh while avoiding repeated historical scans.
+        self.stats_cache = StatsCache(
+            storage,
+            ttl_seconds=STATS_CACHE_TTL_SECONDS,
+            include_codex=False,
+        )
         # AI lifecycle rows belong to the process that observed them. Close
         # anything left by a previous process before the desktop reader starts
         # feeding us fresh transitions; otherwise an old ``inProgress`` row
         # can make Cookie look permanently busy after a restart.
         self.storage.close_open_ai_sessions(status="stale")
-        self._started_turn_ids: set[str] = set()
-        # One focus may run at a time, while any number of other focus
-        # sessions can remain paused for quick task switching.  Older
-        # versions only loaded the newest open session; loading all sessions
-        # here lets a switched task survive a restart as well.
-        selected_focus_id = self._read_focus_id(storage.get_setting("active_focus_id", ""))
-        running_before_recovery = storage.get_running_focus()
-        open_focuses = storage.list_open_focuses()
-        for session in open_focuses:
-            if not session.is_paused:
-                self.storage.recover_open_focus(session)
-        open_focuses = storage.list_open_focuses()
-        selected = next(
-            (session for session in open_focuses if session.id == selected_focus_id),
-            None,
+        self.focus_coordinator = FocusCoordinator(storage, self.stats_cache)
+        self.has_recovered_focus = self.focus_coordinator.has_recovered_focus
+        self.ai_coordinator = AiCoordinator(
+            storage,
+            self.stats_cache,
+            self.has_active_focus,
+            lambda: self.focus is not None,
         )
-        if selected is None and running_before_recovery is not None:
-            selected = next(
-                (session for session in open_focuses if session.id == running_before_recovery.id),
-                None,
-            )
-        self.focus: FocusSession | None = selected or (open_focuses[-1] if open_focuses else None)
-        self._paused_focuses: dict[int, FocusSession] = {
-            session.id: session
-            for session in open_focuses
-            if self.focus is None or session.id != self.focus.id
-        }
-        self._persist_focus_selection(self.focus)
-        self.has_recovered_focus = bool(open_focuses)
-        self.last_ai_completion_seconds: float | None = None
-        self.last_ai_terminal_status: str | None = None
+        self.last_ai_completion_seconds = None
+        self.last_ai_terminal_status = None
+
+    # ------------------------------------------------------------------
+    # Application-facing queries and commands
+    # ------------------------------------------------------------------
+    # The GUI consumes these methods instead of reaching into Storage.  This
+    # keeps persistence details behind the application boundary and gives us a
+    # single place to add cache invalidation, validation, or telemetry later.
+
+    def available_tags(self) -> list[str]:
+        return self.storage.available_tags()
+
+    def tag_usage_counts(self) -> dict[str, int]:
+        return self.storage.tag_usage_counts()
+
+    def add_tag(self, tag: str) -> str:
+        return self.storage.add_tag(tag)
+
+    def rename_tag(self, old_tag: str, new_tag: str) -> str:
+        return self.storage.rename_tag(old_tag, new_tag)
+
+    def delete_tags(self, tags: list[str]) -> int:
+        return self.storage.delete_tags(tags)
+
+    def default_task_entries(self) -> list[DefaultTaskEntry]:
+        return self.storage.default_task_entries()
+
+    def set_default_task_entries(self, entries: list[DefaultTaskEntry]) -> None:
+        self.storage.set_default_task_entries(entries)
+
+    def list_manual_tasks(self) -> list[Task]:
+        return self.storage.list_manual_tasks()
+
+    def add_manual_task(self, title: str, tag: str = DEFAULT_TAG) -> Task:
+        return self.storage.add_manual_task(title, tag)
+
+    def delete_manual_task(self, task_id: int) -> Task | None:
+        return self.storage.delete_manual_task(task_id)
+
+    def today_completed_tasks(
+        self,
+        now: datetime | None = None,
+    ) -> list[CompletedTaskSummary]:
+        return self.storage.today_completed_tasks(now)
+
+    def completed_focus_records(
+        self,
+        task_id: int | None,
+        title: str,
+        kind: TaskKind,
+        tag: str | None = None,
+        now: datetime | None = None,
+    ) -> list[CompletedFocusRecord]:
+        return self.storage.completed_focus_records(task_id, title, kind, tag, now)
+
+    def get_completed_focus_record(self, session_id: int) -> CompletedFocusRecord | None:
+        return self.storage.get_completed_focus_record(session_id)
+
+    def update_completed_focus_end_time(
+        self,
+        session_id: int,
+        ended_at: datetime,
+    ) -> bool:
+        updated = self.storage.update_completed_focus_end_time(session_id, ended_at)
+        if updated:
+            self.stats_cache.invalidate()
+        return updated
+
+    def archive_focus_session(self, session_id: int) -> bool:
+        return self.storage.archive_focus_session(session_id)
+
+    def restore_archived_focus_session(self, session_id: int) -> bool:
+        return self.storage.restore_archived_focus_session(session_id)
+
+    def clear_focus_history(self) -> int:
+        return self.storage.clear_focus_history()
+
+    def tag_waiting_daily_series(
+        self,
+        period: str,
+        now: datetime | None = None,
+    ) -> list[TagTimeBucket]:
+        return self.storage.tag_waiting_daily_series(period, now)
+
+    def get_setting(self, key: str, default: str = "") -> str:
+        return self.storage.get_setting(key, default)
+
+    def set_setting(self, key: str, value: str) -> None:
+        self.storage.set_setting(key, value)
+
+    def load_preferences(self) -> Preferences:
+        return Preferences.load(self.storage)
+
+    def save_preferences(self, preferences: Preferences) -> None:
+        preferences.save(self.storage)
+
+    @property
+    def last_ai_completion_seconds(self) -> float | None:
+        return self.ai_coordinator.last_ai_completion_seconds
+
+    @last_ai_completion_seconds.setter
+    def last_ai_completion_seconds(self, value: float | None) -> None:
+        self.ai_coordinator.last_ai_completion_seconds = value
+
+    @property
+    def last_ai_terminal_status(self) -> str | None:
+        return self.ai_coordinator.last_ai_terminal_status
+
+    @last_ai_terminal_status.setter
+    def last_ai_terminal_status(self, value: str | None) -> None:
+        self.ai_coordinator.last_ai_terminal_status = value
+
+    @property
+    def focus(self) -> FocusSession | None:
+        return self.focus_coordinator.focus
+
+    @focus.setter
+    def focus(self, value: FocusSession | None) -> None:
+        self.focus_coordinator.focus = value
 
     @staticmethod
     def _read_focus_id(value: str) -> int | None:
-        try:
-            focus_id = int(str(value).strip())
-        except (TypeError, ValueError):
-            return None
-        return focus_id if focus_id > 0 else None
+        return FocusCoordinator._read_focus_id(value)
+
 
     def _persist_focus_selection(self, focus: FocusSession | None) -> None:
-        self.storage.set_setting("active_focus_id", str(focus.id) if focus is not None else "")
+        self.focus_coordinator._persist_focus_selection(focus)
+
 
     def suggested_tasks(self) -> list[Task]:
-        return self.storage.suggested_tasks(limit=3)
+        return self.focus_coordinator.suggested_tasks()
 
-    def fixed_cycle_tasks(self, limit: int = 3) -> list[Task]:
-        """Return enabled fixed-cycle tasks without applying manual-task fallback.
 
-        The home picker intentionally prefers manual tasks whenever any exist,
-        but the task switcher must still be able to offer the fixed-cycle queue
-        while a manual task is running.  Keeping this distinction in the
-        service avoids duplicating the default-task conversion in the UI.
-        """
+    def fixed_cycle_tasks(
+        self,
+        limit: int = 3,
+        *,
+        randomize: bool = False,
+    ) -> list[Task]:
+        return self.focus_coordinator.fixed_cycle_tasks(limit, randomize=randomize)
 
-        entries = [entry for entry in self.storage.default_task_entries() if entry.enabled]
-        return [
-            Task(None, entry.title, TaskKind.DEFAULT, offset, entry.tag)
-            for offset, entry in enumerate(entries[:limit])
-        ]
 
     def has_active_focus(self) -> bool:
-        """Return whether the selected focus session is counting time."""
+        return self.focus_coordinator.has_active_focus()
 
-        return self.focus is not None and not self.focus.is_paused
 
     def paused_focuses(self) -> list[FocusSession]:
-        """Return paused sessions, including the currently selected one."""
+        return self.focus_coordinator.paused_focuses()
 
-        sessions = list(self._paused_focuses.values())
-        if self.focus is not None and self.focus.is_paused:
-            sessions.append(self.focus)
-        return sorted(sessions, key=lambda session: session.id, reverse=True)
 
     def open_focuses(self) -> list[FocusSession]:
-        """Return every unfinished focus session for task-safety checks."""
+        return self.focus_coordinator.open_focuses()
 
-        sessions = list(self._paused_focuses.values())
-        if self.focus is not None:
-            sessions.append(self.focus)
-        return sorted(sessions, key=lambda session: session.id, reverse=True)
 
     def _resume_focus_session(
         self,
         session: FocusSession,
         current: datetime,
     ) -> None:
-        if session.paused_at is None:
-            return
-        session.paused_seconds += max(
-            0.0,
-            (current - session.paused_at).total_seconds(),
-        )
-        session.paused_at = None
-        session.last_heartbeat_at = current
-        self.storage.save_focus_pause(session)
+        self.focus_coordinator._resume_focus_session(session, current)
+
 
     def open_ai_sessions(self) -> list[AiSession]:
-        return self.storage.list_open_ai()
+        return self.ai_coordinator.open_ai_sessions()
+
 
     def running_ai_sessions(self) -> list[AiSession]:
-        return [
-            session
-            for session in self.storage.list_open_ai()
-            if _normal_status(session.status) in AI_RUNNING_STATUSES
-        ]
+        return self.ai_coordinator.running_ai_sessions()
+
 
     def attention_ai_sessions(self) -> list[AiSession]:
-        return [
-            session
-            for session in self.storage.list_open_ai()
-            if _normal_status(session.status) in AI_ATTENTION_STATUSES
-        ]
+        return self.ai_coordinator.attention_ai_sessions()
+
 
     def on_ai_started(
         self,
@@ -164,21 +249,8 @@ class WaitLabService:
         when: datetime | None = None,
         show_task_picker: bool = True,
     ) -> ServiceUpdate:
-        session = self.storage.start_ai_session(session_id, turn_id, when=when)
-        is_new_turn = turn_id not in self._started_turn_ids
-        self._started_turn_ids.add(turn_id)
-        self.stats_cache.invalidate()
-        return ServiceUpdate(
-            show_task_picker=(
-                show_task_picker
-                and is_new_turn
-                and not self.has_active_focus()
-                and not session.picker_skipped
-            ),
-            message="Codex 对话开始，选一个 Waiting Task 吧",
-            ai_turn_id=turn_id,
-            ai_status="running",
-        )
+        return self.ai_coordinator.on_ai_started(session_id, turn_id, when, show_task_picker)
+
 
     def on_ai_finished(
         self,
@@ -190,42 +262,16 @@ class WaitLabService:
         started_at: datetime | None = None,
         create_if_missing: bool = False,
     ) -> ServiceUpdate:
-        open_session = self.storage.get_open_ai(turn_id=turn_id)
-        known_session = self.storage.get_ai_session(turn_id)
-        if open_session is None and known_session is not None:
-            return ServiceUpdate()
-        if open_session is None and create_if_missing:
-            self.storage.start_ai_session(session_id or "codex", turn_id, when=started_at)
-            self.stats_cache.invalidate()
-        finished = self.storage.finish_ai_session(
+        return self.ai_coordinator.on_ai_finished(
             turn_id,
-            status=status,
-            when=when,
-            fallback_latest=fallback_latest,
+            when,
+            status,
+            fallback_latest,
+            session_id,
+            started_at,
+            create_if_missing,
         )
-        if finished is not None:
-            self.stats_cache.invalidate()
-            self.last_ai_completion_seconds = finished.active_elapsed_seconds()
-            self.last_ai_terminal_status = status
-        completed = finished is not None and status == "completed"
-        blocked = finished is not None and status != "completed"
-        return ServiceUpdate(
-            ai_completed=completed,
-            ai_blocked=blocked,
-            message=(
-                "Codex 已完成；当前微任务继续计时"
-                if completed and self.focus is not None
-                else "Codex 已完成"
-                if completed
-                else "Codex 已中断；当前微任务继续计时"
-                if blocked and self.focus is not None
-                else "Codex 已中断或运行失败"
-                if blocked
-                else None
-            ),
-            ai_turn_id=finished.turn_id if finished is not None else None,
-            ai_status=status if finished is not None else None,
-        )
+
 
     def on_ai_needs_attention(
         self,
@@ -234,26 +280,13 @@ class WaitLabService:
         when: datetime | None = None,
         fallback_latest: bool = True,
     ) -> ServiceUpdate:
-        session = self.storage.get_open_ai(turn_id=turn_id)
-        if session is None and fallback_latest:
-            session = self.storage.get_open_ai()
-        if session is None:
-            session = self.storage.start_ai_session(session_id, turn_id, when=when)
-            self.stats_cache.invalidate()
-        updated = self.storage.set_ai_status(
-            session.turn_id,
-            "needs_attention",
-            when=when,
-            fallback_latest=fallback_latest,
+        return self.ai_coordinator.on_ai_needs_attention(
+            session_id,
+            turn_id,
+            when,
+            fallback_latest,
         )
-        if updated is not None:
-            self.stats_cache.invalidate()
-        return ServiceUpdate(
-            ai_needs_attention=updated is not None,
-            message="Codex 正在等待批准，微任务继续计时",
-            ai_turn_id=updated.turn_id if updated is not None else None,
-            ai_status="needs_attention" if updated is not None else None,
-        )
+
 
     def on_ai_resumed(
         self,
@@ -261,24 +294,8 @@ class WaitLabService:
         fallback_latest: bool = True,
         when: datetime | None = None,
     ) -> ServiceUpdate:
-        session = self.storage.get_open_ai(turn_id=turn_id)
-        if session is None and fallback_latest:
-            session = self.storage.get_open_ai()
-        if session is None or session.status != "needs_attention":
-            return ServiceUpdate()
-        self.storage.set_ai_status(
-            session.turn_id,
-            "running",
-            when=when,
-            fallback_latest=fallback_latest,
-        )
-        self.stats_cache.invalidate()
-        return ServiceUpdate(
-            ai_resumed=True,
-            message="已批准，Codex 继续工作",
-            ai_turn_id=session.turn_id,
-            ai_status="running",
-        )
+        return self.ai_coordinator.on_ai_resumed(turn_id, fallback_latest, when)
+
 
     def reconcile_desktop_sessions(
         self,
@@ -286,220 +303,54 @@ class WaitLabService:
         now: datetime | None = None,
         stale_after_seconds: float = AI_STALE_AFTER_SECONDS,
     ) -> ServiceUpdate:
-        """Reconcile persisted sessions with the desktop lifecycle source.
-
-        This closes terminal rows missed while WaitLAB was not running and
-        stops counting a running row whose item activity has gone stale.  Once
-        the desktop source is available, a non-manual session that disappears
-        from its bounded snapshot is also closed after a grace period.  This
-        prevents a stale ``running`` row from keeping the Cookie in the
-        working state forever after Codex exits unexpectedly.
-        """
-
-        current = now or utc_now()
-        by_turn = {snapshot.turn_id: snapshot for snapshot in snapshots}
-        completed = False
-        blocked = False
-        stale = False
-        terminal_turn_id: str | None = None
-        for session in self.storage.list_open_ai():
-            snapshot = by_turn.get(session.turn_id)
-            if snapshot is None:
-                # Manual fallback sessions do not have a corresponding row in
-                # Codex's database and must remain under explicit user control.
-                # Hook/desktop sessions, however, should eventually be present
-                # in the authoritative snapshot; close an orphan after the
-                # same five-minute safety window used for stale activity.
-                if (
-                    session.session_id != "manual"
-                    and _normal_status(session.status) in AI_RUNNING_STATUSES
-                    and (current - session.started_at).total_seconds()
-                    > AI_MISSING_AFTER_SECONDS
-                ):
-                    if self.storage.finish_ai_session(
-                        session.turn_id,
-                        status="stale",
-                        when=current,
-                        fallback_latest=False,
-                    ) is not None:
-                        self.stats_cache.invalidate()
-                        self.last_ai_terminal_status = "stale"
-                        blocked = True
-                        stale = True
-                        terminal_turn_id = session.turn_id
-                continue
-            normalized = _normal_status(snapshot.status)
-            if normalized in COMPLETED_STATUSES:
-                ended_at = snapshot.completed_at or current
-                finished = self.storage.finish_ai_session(
-                    session.turn_id,
-                    status="completed",
-                    when=ended_at,
-                    fallback_latest=False,
-                )
-                if finished is not None:
-                    self.stats_cache.invalidate()
-                    self.last_ai_completion_seconds = finished.active_elapsed_seconds(ended_at)
-                    self.last_ai_terminal_status = "completed"
-                    completed = True
-                    terminal_turn_id = session.turn_id
-                continue
-            if normalized in BLOCKED_STATUSES:
-                ended_at = snapshot.completed_at or current
-                finished = self.storage.finish_ai_session(
-                    session.turn_id,
-                    status="blocked",
-                    when=ended_at,
-                    fallback_latest=False,
-                )
-                if finished is not None:
-                    self.stats_cache.invalidate()
-                    self.last_ai_completion_seconds = finished.active_elapsed_seconds(ended_at)
-                    self.last_ai_terminal_status = "blocked"
-                    blocked = True
-                    terminal_turn_id = session.turn_id
-                continue
-            if normalized in AI_ATTENTION_STATUSES:
-                if _normal_status(session.status) not in AI_ATTENTION_STATUSES:
-                    updated = self.storage.set_ai_status(
-                        session.turn_id,
-                        "needs_attention",
-                        when=snapshot.last_activity_at or current,
-                        fallback_latest=False,
-                    )
-                    if updated is not None:
-                        self.stats_cache.invalidate()
-                continue
-            if normalized in AI_RUNNING_STATUSES:
-                # Some Codex database versions do not expose item timestamps.
-                # In that case the turn start is the only freshness signal;
-                # an ``inProgress`` row with no activity for the safety window
-                # is treated as an orphan rather than running forever.
-                last_activity = snapshot.last_activity_at or snapshot.started_at
-                if (
-                    (current - last_activity).total_seconds() > stale_after_seconds
-                ):
-                    if self.storage.finish_ai_session(
-                        session.turn_id,
-                        status="stale",
-                        when=last_activity,
-                        fallback_latest=False,
-                    ) is not None:
-                        self.stats_cache.invalidate()
-                        self.last_ai_terminal_status = "stale"
-                        blocked = True
-                        stale = True
-        if stale:
-            message = "Codex 状态长时间没有更新，已停止计时（仅停止本轮状态跟踪，不影响 Waiting Task）；请重新发起任务。"
-        elif blocked:
-            message = "Codex 任务已中断，本轮状态跟踪已停止。"
-        elif completed:
-            message = "Codex 已完成，本轮状态跟踪已停止。"
-        else:
-            message = None
-        return ServiceUpdate(
-            ai_completed=completed,
-            ai_blocked=blocked,
-            message=message,
-            ai_turn_id=terminal_turn_id,
-            ai_status="completed" if completed else "blocked" if blocked else None,
+        return self.ai_coordinator.reconcile_desktop_sessions(
+            snapshots,
+            now,
+            stale_after_seconds,
         )
 
+
     def start_focus(self, task: Task, when: datetime | None = None) -> ServiceUpdate:
-        if self.has_active_focus():
-            raise RuntimeError("已有正在进行的微任务；请先暂停后再切换")
-        current = when or utc_now()
-        existing = self.storage.get_open_focus_for_task(task)
-        if existing is not None:
-            if self.focus is not None and self.focus.id != existing.id:
-                if self.focus.is_paused:
-                    self._paused_focuses[self.focus.id] = self.focus
-            self._paused_focuses.pop(existing.id, None)
-            self._resume_focus_session(existing, current)
-            self.focus = existing
-            message = f"继续：{task.title}"
-        else:
-            if self.focus is not None and self.focus.is_paused:
-                self._paused_focuses[self.focus.id] = self.focus
-            self.focus = self.storage.start_focus(task, when=current)
-            message = f"开始：{task.title}"
-        self._persist_focus_selection(self.focus)
-        self.stats_cache.invalidate()
-        return ServiceUpdate(focus_changed=True, message=message)
+        return self.focus_coordinator.start_focus(task, when)
+
 
     def toggle_focus_pause(self, when: datetime | None = None) -> ServiceUpdate:
-        if self.focus is None:
-            return ServiceUpdate()
-        if self.focus.paused_at is None:
-            return self.pause_focus(when=when)
-        return self.resume_focus(when=when)
+        return self.focus_coordinator.toggle_focus_pause(when)
+
 
     def pause_focus(
         self,
         when: datetime | None = None,
         message: str = "微任务已暂停",
     ) -> ServiceUpdate:
-        if self.focus is None or self.focus.paused_at is not None:
-            return ServiceUpdate()
-        current = when or utc_now()
-        self.focus.paused_at = current
-        self.focus.last_heartbeat_at = current
-        self._persist_focus_selection(self.focus)
-        self.storage.save_focus_pause(self.focus)
-        self.stats_cache.invalidate()
-        return ServiceUpdate(focus_changed=True, message=message)
+        return self.focus_coordinator.pause_focus(when, message)
+
 
     def resume_focus(
         self,
         when: datetime | None = None,
         message: str = "继续微任务",
     ) -> ServiceUpdate:
-        if self.focus is None or self.focus.paused_at is None:
-            return ServiceUpdate()
-        current = when or utc_now()
-        self._resume_focus_session(self.focus, current)
-        self._persist_focus_selection(self.focus)
-        self._paused_focuses.pop(self.focus.id, None)
-        self.stats_cache.invalidate()
-        return ServiceUpdate(focus_changed=True, message=message)
+        return self.focus_coordinator.resume_focus(when, message)
+
 
     def heartbeat(self, when: datetime | None = None) -> None:
-        if self.focus is not None and not self.focus.is_paused:
-            self.storage.heartbeat_focus(self.focus, when=when)
+        self.focus_coordinator.heartbeat(when)
+
 
     def complete_focus(self, when: datetime | None = None) -> ServiceUpdate:
-        if self.focus is None:
-            return ServiceUpdate()
-        completed = self.focus
-        self.storage.finish_focus_and_task(completed, FocusOutcome.COMPLETED, when=when)
-        self.stats_cache.invalidate()
-        self._persist_focus_selection(None)
-        self.focus = None
-        return ServiceUpdate(focus_changed=True, message="微任务完成，做得漂亮")
+        return self.focus_coordinator.complete_focus(when)
 
     def abandon_focus(self, when: datetime | None = None) -> ServiceUpdate:
-        if self.focus is None:
-            return ServiceUpdate()
-        abandoned = self.focus
-        self.storage.finish_focus_and_task(abandoned, FocusOutcome.ABANDONED, when=when)
-        self.stats_cache.invalidate()
-        self._persist_focus_selection(None)
-        self.focus = None
-        return ServiceUpdate(focus_changed=True, message="任务已放回任务池")
+        return self.focus_coordinator.abandon_focus(when)
 
     def manual_ai_started(self, when: datetime | None = None) -> ServiceUpdate:
-        marker = f"manual-{int((when or utc_now()).timestamp() * 1000)}"
-        return self.on_ai_started("manual", marker, when=when)
+        return self.ai_coordinator.manual_ai_started(when)
+
 
     def manual_ai_finished(self, when: datetime | None = None) -> ServiceUpdate:
-        open_ai = self.storage.get_open_ai()
-        if open_ai is None:
-            return ServiceUpdate(message="当前没有正在等待的 Codex 任务")
-        return self.on_ai_finished(open_ai.turn_id, when=when)
+        return self.ai_coordinator.manual_ai_finished(when)
+
 
     def skip_current_ai_round(self) -> ServiceUpdate:
-        open_ai = self.storage.get_open_ai()
-        if open_ai is None:
-            return ServiceUpdate(message="当前没有正在等待的 Codex 任务")
-        self.storage.skip_ai_picker(open_ai.turn_id)
-        return ServiceUpdate(message="本轮已跳过；新的 Codex 任务仍会提醒")
+        return self.ai_coordinator.skip_current_ai_round()

@@ -1,4 +1,13 @@
 from waitlab.ui import PresentationMode, choose_presentation_mode
+from waitlab.ui_primitives import (
+    PresentationMode as PrimitivePresentationMode,
+    choose_presentation_mode as primitive_choose_presentation_mode,
+)
+
+
+def test_ui_module_keeps_primitive_compatibility_exports():
+    assert PresentationMode is PrimitivePresentationMode
+    assert choose_presentation_mode is primitive_choose_presentation_mode
 
 
 def test_idle_uses_icon_mode():

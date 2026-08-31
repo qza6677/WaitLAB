@@ -5,11 +5,18 @@ from dataclasses import dataclass
 from datetime import datetime
 from enum import StrEnum
 from pathlib import Path
-from typing import Any
+from typing import Any, Protocol
 
 from .hook_installer import HOOK_EVENTS, MARKER, default_hooks_path
 from .models import from_iso, to_iso, utc_now
-from .storage import Storage
+
+
+class SettingsStore(Protocol):
+    """Small persistence port required by :class:`HookConnectionMonitor`."""
+
+    def get_setting(self, key: str, default: str = "") -> str: ...
+
+    def set_setting(self, key: str, value: str) -> None: ...
 
 
 class HookConnectionState(StrEnum):
@@ -89,8 +96,8 @@ def configured_waitlab_events(path: Path) -> tuple[str, ...]:
 
 
 class HookConnectionMonitor:
-    def __init__(self, storage: Storage, hooks_path: Path | None = None) -> None:
-        self.storage = storage
+    def __init__(self, settings: SettingsStore, hooks_path: Path | None = None) -> None:
+        self.settings = settings
         self.hooks_path = hooks_path or default_hooks_path()
         self.listener_error: str | None = None
 
@@ -98,13 +105,13 @@ class HookConnectionMonitor:
         self.listener_error = error or None
 
     def record_event(self, event_name: str, when: datetime | None = None) -> None:
-        self.storage.set_setting("last_hook_event_name", event_name)
-        self.storage.set_setting("last_hook_event_at", to_iso(when or utc_now()) or "")
+        self.settings.set_setting("last_hook_event_name", event_name)
+        self.settings.set_setting("last_hook_event_at", to_iso(when or utc_now()) or "")
 
     def inspect(self) -> HookConnectionInfo:
         configured = configured_waitlab_events(self.hooks_path)
-        last_name = self.storage.get_setting("last_hook_event_name", "") or None
-        last_at = from_iso(self.storage.get_setting("last_hook_event_at", ""))
+        last_name = self.settings.get_setting("last_hook_event_name", "") or None
+        last_at = from_iso(self.settings.get_setting("last_hook_event_at", ""))
 
         if self.listener_error:
             state = HookConnectionState.LISTENER_FAILED

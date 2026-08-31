@@ -23,12 +23,16 @@ def sanitized_event(raw: dict) -> dict | None:
     event_name = raw.get("hook_event_name") or raw.get("event")
     if event_name not in ALLOWED_EVENTS:
         return None
-    return {
+    payload = {
         "event": event_name,
         "session_id": str(raw.get("session_id") or "codex"),
         "turn_id": str(raw.get("turn_id") or ""),
         "timestamp": time.time(),
     }
+    token = os.environ.get("WAITLAB_HOOK_TOKEN", "").strip()
+    if token:
+        payload["token"] = token
+    return payload
 
 
 def send_event(payload: dict, port: int | None = None) -> None:

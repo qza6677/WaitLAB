@@ -1,6 +1,6 @@
 [project]
 name = "waitlab"
-version = "0.5.16"
+version = "0.5.17"
 description = "A local Windows waiting assistant that turns Codex wait time into focused microtasks."
 requires-python = ">=3.11"
 dependencies = [
@@ -13,6 +13,7 @@ waitlab = "waitlab.app:main"
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 pythonpath = ["."]
+filterwarnings = ["error::ResourceWarning"]
 
 [tool.mypy]
 ignore_missing_imports = true

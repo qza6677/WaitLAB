@@ -1,4 +1,5 @@
 import sqlite3
+from contextlib import closing
 from datetime import datetime, timezone
 
 from waitlab.desktop_activity import DesktopActivityReader, DesktopEventKind
@@ -8,7 +9,7 @@ NOW = datetime(2026, 8, 26, 8, 0, tzinfo=timezone.utc)
 
 
 def create_history(path) -> None:
-    with sqlite3.connect(path) as connection:
+    with closing(sqlite3.connect(path)) as connection:
         connection.execute(
             """
             CREATE TABLE thread_turns (
@@ -21,22 +22,25 @@ def create_history(path) -> None:
             )
             """
         )
+        connection.commit()
 
 
 def add_turn(path, thread_id, turn_id, status, started_at, completed_at=None) -> None:
-    with sqlite3.connect(path) as connection:
+    with closing(sqlite3.connect(path)) as connection:
         connection.execute(
             "INSERT INTO thread_turns VALUES (?, ?, ?, ?, ?, ?)",
             (thread_id, turn_id, status, started_at, completed_at, None),
         )
+        connection.commit()
 
 
 def set_status(path, turn_id, status, completed_at=None) -> None:
-    with sqlite3.connect(path) as connection:
+    with closing(sqlite3.connect(path)) as connection:
         connection.execute(
             "UPDATE thread_turns SET status = ?, completed_at = ? WHERE turn_id = ?",
             (status, completed_at, turn_id),
         )
+        connection.commit()
 
 
 def test_initial_poll_emits_only_currently_running_turns(tmp_path):
@@ -104,8 +108,9 @@ def test_poll_reads_a_bounded_recent_window_for_large_history(tmp_path):
         )
         for index in range(2000)
     ]
-    with sqlite3.connect(path) as connection:
+    with closing(sqlite3.connect(path)) as connection:
         connection.executemany("INSERT INTO thread_turns VALUES (?, ?, ?, ?, ?, ?)", rows)
+        connection.commit()
 
     reader = DesktopActivityReader(path, now=lambda: NOW, max_rows=64)
     assert reader.poll() == []
@@ -164,7 +169,7 @@ def test_missing_or_incompatible_database_degrades_without_crashing(tmp_path):
 def test_status_snapshot_reads_item_timestamp_without_item_contents(tmp_path):
     path = tmp_path / "thread_history_1.sqlite"
     create_history(path)
-    with sqlite3.connect(path) as connection:
+    with closing(sqlite3.connect(path)) as connection:
         connection.execute(
             "CREATE TABLE thread_items (thread_id TEXT, turn_id TEXT, created_at_ms INTEGER, item_json TEXT)"
         )
@@ -176,6 +181,7 @@ def test_status_snapshot_reads_item_timestamp_without_item_contents(tmp_path):
             "INSERT INTO thread_items VALUES (?, ?, ?, ?)",
             ("thread-1", "turn-1", 1_787_700_123_000, "secret content"),
         )
+        connection.commit()
 
     reader = DesktopActivityReader(path, now=lambda: NOW)
     reader.poll()

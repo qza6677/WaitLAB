@@ -4,7 +4,7 @@ from datetime import datetime, timedelta, timezone
 import pytest
 
 from waitlab.desktop_activity import DesktopTurnSnapshot
-from waitlab.models import DefaultTaskEntry, TaskKind
+from waitlab.models import DefaultTaskEntry, FocusOutcome, TaskKind
 from waitlab.service import WaitLabService
 from waitlab.storage import DEFAULT_TASKS, Storage
 
@@ -30,6 +30,27 @@ def test_manual_tasks_completely_replace_default_suggestions(service):
 
     assert [task.title for task in suggestions] == ["修改 Discussion 第二段"]
     assert all(task.kind is TaskKind.MANUAL for task in suggestions)
+
+
+def test_service_end_time_update_invalidates_statistics_cache(service, monkeypatch):
+    task = service.storage.add_manual_task("服务层修正结束时间")
+    started = moment()
+    original_end = moment(10)
+    corrected_end = moment(5)
+    session = service.storage.start_focus(task, when=started)
+    service.storage.finish_focus_and_task(session, FocusOutcome.COMPLETED, when=original_end)
+    invalidations: list[bool] = []
+    monkeypatch.setattr(
+        service.stats_cache,
+        "invalidate",
+        lambda: invalidations.append(True),
+    )
+
+    assert service.update_completed_focus_end_time(session.id, corrected_end) is True
+    assert invalidations == [True]
+    record = service.get_completed_focus_record(session.id)
+    assert record is not None
+    assert record.ended_at == corrected_end
 
 
 def test_default_tasks_rotate_after_completion(service):
@@ -65,6 +86,61 @@ def test_fixed_tasks_can_be_customized_reordered_and_disabled(service):
     service.start_focus(suggestions[0], when=moment())
     service.complete_focus(when=moment(1))
     assert [task.title for task in service.suggested_tasks()] == ["任务 B", "任务 C"]
+
+
+def test_fixed_cycle_sampling_is_opt_in_and_respects_small_pools(service, monkeypatch):
+    service.storage.set_default_task_entries(
+        [
+            DefaultTaskEntry("任务 A", True),
+            DefaultTaskEntry("任务 B", True),
+            DefaultTaskEntry("任务 C", True),
+            DefaultTaskEntry("任务 D", True),
+        ]
+    )
+    sampled = []
+
+    def fake_sample(entries, count):
+        sampled.append((list(entries), count))
+        return [entries[3], entries[1], entries[0]]
+
+    monkeypatch.setattr("waitlab.service.random.sample", fake_sample)
+
+    assert [task.title for task in service.fixed_cycle_tasks()] == [
+        "任务 A",
+        "任务 B",
+        "任务 C",
+    ]
+    assert [task.title for task in service.fixed_cycle_tasks(randomize=True)] == [
+        "任务 D",
+        "任务 B",
+        "任务 A",
+    ]
+    assert sampled and sampled[0][1] == 3
+
+    service.storage.set_default_task_entries(
+        [DefaultTaskEntry("任务一", True), DefaultTaskEntry("任务二", True)]
+    )
+    assert [task.title for task in service.fixed_cycle_tasks(randomize=True)] == [
+        "任务一",
+        "任务二",
+    ]
+
+
+def test_fixed_cycle_advances_only_after_completion(service):
+    first = service.fixed_cycle_tasks()[0]
+    second = service.fixed_cycle_tasks()[1]
+
+    service.start_focus(first, when=moment())
+    service.pause_focus(when=moment(1))
+    assert service.storage.default_task_entries()[0].title == first.title
+
+    service.start_focus(second, when=moment(2))
+    service.abandon_focus(when=moment(3))
+    assert service.storage.default_task_entries()[0].title == first.title
+
+    service.start_focus(first, when=moment(4))
+    service.complete_focus(when=moment(5))
+    assert service.storage.default_task_entries()[0].title != first.title
 
 
 def test_all_fixed_tasks_may_be_disabled(service):
@@ -161,7 +237,7 @@ def test_reconcile_stops_orphaned_running_row_after_desktop_grace(service):
     assert session is not None and session.status == "stale"
 
 
-def test_reconcile_stops_running_row_without_item_activity(service):
+def test_reconcile_keeps_running_row_without_item_activity(service):
     service.on_ai_started("thread-1", "turn-no-items", when=moment())
     snapshot = DesktopTurnSnapshot(
         thread_id="thread-1",
@@ -177,8 +253,8 @@ def test_reconcile_stops_running_row_without_item_activity(service):
         now=moment(6),
     )
 
-    assert update.ai_blocked is True
-    assert service.storage.get_open_ai("turn-no-items") is None
+    assert update.ai_blocked is False
+    assert service.storage.get_open_ai("turn-no-items") is not None
 
 
 def test_running_ai_sessions_include_any_parallel_turn(service):

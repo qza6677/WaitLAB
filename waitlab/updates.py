@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import re
 import shutil
+import sys
 import subprocess
 import tempfile
 import time
@@ -19,6 +21,7 @@ USER_AGENT = "WaitLAB"
 RETRY_COUNT = 3
 RETRY_DELAYS = (2, 4)
 CHUNK_SIZE = 1024 * 1024
+MAX_INSTALLER_BYTES = 512 * 1024 * 1024
 TRUSTED_RELEASE_HOSTS = {
     "api.github.com",
     "github.com",
@@ -72,7 +75,7 @@ def describe_update_error(error: BaseException) -> str:
     if "sha-256" in lowered or "sha256" in lowered:
         return "更新包校验失败，未安装本次更新。"
     if "not trusted" in lowered or ("windows" in lowered and "installer" in lowered):
-        return "鏇存柊鏂囦欢鏍煎紡鎴栦笅杞藉湴鍧€涓嶅彲淇°€傛湭瀹夎鏈鏇存柊銆?"
+        return "更新文件格式或下载地址不可信。未安装本次更新。"
     if "403" in text or "429" in text:
         return "GitHub 暂时限制了请求，请稍后再试。"
     if not text:
@@ -121,13 +124,20 @@ def _download_to_file(
         request = Request(url, headers={"Accept": "application/octet-stream", "User-Agent": USER_AGENT})
         try:
             with urlopen(request, timeout=timeout) as response, target.open("wb") as output:
+                written = 0
                 while chunk := response.read(CHUNK_SIZE):
+                    written += len(chunk)
+                    if written > MAX_INSTALLER_BYTES:
+                        raise ValueError("更新包超过允许的大小限制")
                     output.write(chunk)
             return
         except HTTPError as exc:
             if exc.code < 500:
                 raise
             last_error = exc
+        except ValueError:
+            target.unlink(missing_ok=True)
+            raise
         except (URLError, TimeoutError, OSError) as exc:
             last_error = exc
         if attempt < attempts - 1:
@@ -197,7 +207,11 @@ def download_verified_installer(release: ReleaseInfo) -> Path:
         if Path(filename).name == target.name:
             expected = fields[0].upper()
             break
-    actual = hashlib.sha256(target.read_bytes()).hexdigest().upper()
+    digest = hashlib.sha256()
+    with target.open("rb") as stream:
+        while chunk := stream.read(CHUNK_SIZE):
+            digest.update(chunk)
+    actual = digest.hexdigest().upper()
     if not expected or actual != expected:
         shutil.rmtree(target.parent, ignore_errors=True)
         raise ValueError("更新包 SHA-256 校验失败")
@@ -211,11 +225,47 @@ def launch_installer(path: Path) -> None:
 def cleanup_download_directory(path: Path, delay_seconds: float = 3.0) -> None:
     """Remove an updater's temporary directory after the installer exits."""
 
-    parent = path.parent
+    parent = path.resolve().parent
+    temp_root = Path(tempfile.gettempdir()).resolve()
+    try:
+        parent.relative_to(temp_root)
+    except ValueError:
+        # Only remove directories created by ``download_verified_installer``.
+        return
+    if not parent.name.startswith("waitlab-update-"):
+        return
+
+    delay = max(0.0, float(delay_seconds))
+
+    if sys.platform == "win32":
+        # The application exits immediately after launching the installer, so
+        # an in-process daemon thread is not reliable.  Detach a hidden cmd
+        # process that waits for the installer to release the file and then
+        # removes the directory.
+        seconds = int(math.ceil(delay))
+        wait_command = (
+            f'timeout /t {seconds} /nobreak >nul & '
+            f'rmdir /s /q "{parent}"'
+        )
+        creation_flags = getattr(subprocess, "DETACHED_PROCESS", 0x00000008)
+        creation_flags |= getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)
+        try:
+            subprocess.Popen(
+                ["cmd.exe", "/d", "/c", wait_command],
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                close_fds=True,
+                creationflags=creation_flags,
+            )
+            return
+        except (OSError, ValueError):
+            # Fall back to the thread below if cmd.exe cannot be started.
+            pass
 
     def worker() -> None:
         # Give Windows time to spawn the installer before removing its parent.
-        time.sleep(max(0.0, delay_seconds))
+        time.sleep(delay)
         for _ in range(10):
             try:
                 shutil.rmtree(parent, ignore_errors=False)

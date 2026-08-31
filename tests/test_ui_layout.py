@@ -1,17 +1,26 @@
 import os
 import time
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 import pytest
 from PySide6.QtCore import QObject, QPoint, QRect, QThread, QTimer, Qt, Signal, Slot
-from PySide6.QtWidgets import QApplication, QMessageBox, QPushButton
+from PySide6.QtTest import QTest
+from PySide6.QtWidgets import QApplication, QDialog, QMessageBox, QPushButton
 
-from waitlab.models import FocusOutcome, ServiceUpdate, Task, TaskKind
+from waitlab.models import (
+    DefaultTaskEntry,
+    FocusOutcome,
+    ServiceUpdate,
+    TagTimeBucket,
+    Task,
+    TaskKind,
+)
 from waitlab.app import DesktopActivityReceiver
 from waitlab.service import WaitLabService
 from waitlab.storage import Storage
+import waitlab.ui as ui_module
 from waitlab.ui import (
     DailyTagStackedChart,
     PetWindow,
@@ -184,7 +193,9 @@ def test_paused_player_can_open_switcher_and_start_another_task(pet_window, qt_a
 
 def test_switcher_includes_fixed_cycle_tasks_with_manual_tasks(pet_window, qt_app):
     current = pet_window.service.storage.add_manual_task("当前手动任务")
-    fixed = pet_window.service.fixed_cycle_tasks()[0]
+    fixed_titles = {
+        task.title for task in pet_window.service.fixed_cycle_tasks(limit=100)
+    }
     pet_window.start_focus(current)
     _flush(qt_app)
 
@@ -196,14 +207,87 @@ def test_switcher_includes_fixed_cycle_tasks_with_manual_tasks(pet_window, qt_ap
     fixed_button = next(
         button
         for button in pet_window.suggestion_container.findChildren(QPushButton)
-        if button.objectName() == "taskButton" and fixed.title in button.text()
+        if button.objectName() == "taskButton"
+        and any(title in button.text() for title in fixed_titles)
     )
     fixed_button.click()
     _flush(qt_app)
 
     assert pet_window.service.focus is not None
     assert pet_window.service.focus.task.kind is TaskKind.DEFAULT
-    assert pet_window.service.focus.task.title == fixed.title
+    assert pet_window.service.focus.task.title in fixed_titles
+
+
+def test_home_picker_shows_manual_and_stable_fixed_sample(pet_window, qt_app):
+    manual = pet_window.service.storage.add_manual_task("主页具体任务")
+    pet_window.task_picker_open = True
+    pet_window.refresh()
+    _flush(qt_app)
+
+    first_sample = [task.title for task in pet_window._fixed_cycle_candidates or []]
+    task_buttons = [
+        button
+        for button in pet_window.suggestion_container.findChildren(QPushButton)
+        if button.objectName() == "taskButton"
+    ]
+    assert manual.title in " ".join(button.text() for button in task_buttons)
+    assert first_sample
+    assert all(
+        any(title in button.text() for button in task_buttons)
+        for title in first_sample
+    )
+
+    pet_window.refresh()
+    _flush(qt_app)
+    assert [task.title for task in pet_window._fixed_cycle_candidates or []] == first_sample
+
+
+def test_fixed_task_button_can_start_without_manual_tasks(pet_window, qt_app):
+    pet_window.task_picker_open = True
+    pet_window.refresh()
+    _flush(qt_app)
+
+    fixed_button = next(
+        button
+        for button in pet_window.suggestion_container.findChildren(QPushButton)
+        if button.objectName() == "taskButton"
+    )
+    fixed_button.click()
+    _flush(qt_app)
+
+    assert pet_window.service.focus is not None
+    assert pet_window.service.focus.task.kind is TaskKind.DEFAULT
+
+
+def test_home_picker_can_reenable_disabled_fixed_tasks_without_overwriting_titles(
+    pet_window, qt_app
+):
+    fixed_title = "保留的固定任务"
+    pet_window.service.storage.set_default_task_entries(
+        [DefaultTaskEntry(fixed_title, False, "未分类")]
+    )
+    pet_window._invalidate_fixed_cycle_candidates()
+    pet_window.task_picker_open = True
+    pet_window.refresh()
+    _flush(qt_app)
+
+    assert pet_window.picker_source.text() == "固定任务未启用"
+    assert pet_window.enable_fixed_tasks_button.isVisible()
+    assert not any(
+        button.objectName() == "taskButton"
+        for button in pet_window.suggestion_container.findChildren(QPushButton)
+    )
+
+    pet_window.enable_fixed_tasks_button.click()
+    _flush(qt_app)
+
+    assert not pet_window.enable_fixed_tasks_button.isVisible()
+    fixed_button = next(
+        button
+        for button in pet_window.suggestion_container.findChildren(QPushButton)
+        if button.objectName() == "taskButton"
+    )
+    assert fixed_title in fixed_button.text()
 
 
 def test_statistics_dialog_shows_donut_and_daily_stacked_chart(qt_app, tmp_path):
@@ -232,6 +316,55 @@ def test_statistics_dialog_shows_donut_and_daily_stacked_chart(qt_app, tmp_path)
     finally:
         dialog.close()
         storage.close()
+
+
+def test_daily_stacked_chart_hits_segments_and_locks_details(qt_app):
+    chart = DailyTagStackedChart()
+    start = datetime(2026, 8, 24, tzinfo=datetime.now().astimezone().tzinfo)
+    chart.resize(640, 290)
+    chart.set_data(
+        "week",
+        [
+            TagTimeBucket(
+                start,
+                start + timedelta(days=1),
+                {"写作": 3600, "编码": 1800},
+            ),
+            TagTimeBucket(
+                start + timedelta(days=1),
+                start + timedelta(days=2),
+                {"阅读": 900},
+            ),
+        ],
+    )
+    chart.show()
+    try:
+        _flush(qt_app)
+        assert len(chart._segments) == 3
+        segment = chart._segments[0]
+        assert segment.rect.width() > 0
+        assert segment.rect.height() > 0
+
+        point = segment.rect.center().toPoint()
+        QTest.mouseMove(chart, point)
+        _flush(qt_app)
+        assert chart._hovered_index == 0
+        assert "日期：" in chart.toolTip()
+        assert f"标签：{segment.tag}" in chart.toolTip()
+        assert "时长：" in chart.toolTip()
+        assert "当日占比：" in chart.toolTip()
+
+        QTest.mouseClick(chart, Qt.MouseButton.LeftButton, pos=point)
+        _flush(qt_app)
+        assert chart._locked_index == 0
+
+        blank = QPoint(8, 8)
+        QTest.mouseClick(chart, Qt.MouseButton.LeftButton, pos=blank)
+        _flush(qt_app)
+        assert chart._locked_index == -1
+        assert chart.toolTip() == ""
+    finally:
+        chart.close()
 
 
 def test_minimized_picker_restores_by_clicking_cookie(pet_window, qt_app):
@@ -298,6 +431,34 @@ def test_home_and_task_pool_use_colored_tag_chips(qt_app, tmp_path):
         storage.close()
 
 
+def test_home_tag_picker_is_single_line_and_scrollable(qt_app, tmp_path):
+    storage = Storage(tmp_path / "waitlab.db")
+    service = WaitLabService(storage)
+    window = PetWindow(service)
+    try:
+        window.task_picker_open = True
+        window.refresh()
+        _flush(qt_app)
+
+        bar = window.quick_task_tag
+        scroll = window.quick_task_tag_scroll
+        assert bar._layout.wraps() is False
+        assert scroll.verticalScrollBarPolicy() == Qt.ScrollBarPolicy.ScrollBarAlwaysOff
+        assert scroll.horizontalScrollBarPolicy() == Qt.ScrollBarPolicy.ScrollBarAsNeeded
+        assert len({button.geometry().y() for button in bar.findChildren(QPushButton, "tagChip")}) == 1
+        assert scroll.horizontalScrollBar().maximum() > 0
+
+        bar.set_tags(["很长的标签一", "很长的标签二", "很长的标签三", "很长的标签四"])
+        _flush(qt_app)
+        assert bar.width() == bar.sizeHint().width()
+        assert scroll.horizontalScrollBar().maximum() > 0
+        assert len({button.geometry().y() for button in bar.findChildren(QPushButton, "tagChip")}) == 1
+    finally:
+        window.timer.stop()
+        window.close()
+        storage.close()
+
+
 def test_compact_tag_bar_height_update_is_idempotent(qt_app):
     bar = TagChipBar(["未分类", "论文写作", "文献阅读", "Vibe coding", "摸鱼", "会议准备"])
     bar.resize(120, 40)
@@ -358,6 +519,44 @@ def test_header_title_and_actions_have_separate_geometry(pet_window, qt_app):
         assert not title_rect.intersects(button_rect)
 
 
+def test_home_picker_uses_compact_rows_without_shrinking_click_targets(
+    pet_window, qt_app
+):
+    pet_window.task_picker_open = True
+    pet_window.refresh()
+    _flush(qt_app)
+
+    task_buttons = [
+        button
+        for button in pet_window.suggestion_container.findChildren(QPushButton)
+        if button.objectName() == "taskButton"
+    ]
+    assert task_buttons
+    assert all(30 <= button.height() <= 34 for button in task_buttons)
+    assert pet_window.quick_task_tag.height() <= 54
+    assert pet_window.picker.layout().spacing() <= 2
+    assert pet_window.header_details.height() <= 70
+
+
+def test_home_header_rows_stay_tight_after_notice_mode_polish(pet_window, qt_app):
+    pet_window.task_picker_open = True
+    pet_window.refresh()
+    _flush(qt_app)
+
+    pet_window.task_picker_open = False
+    pet_window.show_notice("notice", "body", duration=30)
+    _flush(qt_app)
+
+    action_buttons = [
+        button
+        for button in pet_window.header_details.findChildren(QPushButton)
+        if button.objectName() == "ghostButton"
+    ]
+    assert len(action_buttons) == 3
+    assert all(button.height() == 28 for button in action_buttons)
+    assert pet_window.header_details.height() <= 70
+
+
 @pytest.mark.parametrize("cookie_size", [48, 88, 160])
 def test_cookie_size_controls_bubble_geometry(cookie_size, tmp_path, qt_app):
     storage = Storage(tmp_path / "waitlab.db")
@@ -401,6 +600,49 @@ def test_completed_history_row_can_restart_same_task(tmp_path, qt_app):
         assert service.focus is not None
         assert service.focus.task.id == task.id
         assert service.focus.task.title == task.title
+    finally:
+        window.timer.stop()
+        window.close()
+        storage.close()
+
+
+def test_completed_history_can_edit_end_time(tmp_path, qt_app, monkeypatch):
+    storage = Storage(tmp_path / "waitlab.db")
+    service = WaitLabService(storage)
+    task = storage.add_manual_task("修改历史结束时间")
+    now = datetime.now().astimezone().replace(microsecond=0)
+    original_end = now - timedelta(minutes=3)
+    corrected_end = now - timedelta(minutes=8)
+    session = storage.start_focus(task, when=now - timedelta(minutes=12))
+    storage.finish_focus_and_task(session, FocusOutcome.COMPLETED, when=original_end)
+
+    class FakeEndTimeDialog:
+        def __init__(self, record, parent):
+            self.record = record
+
+        def exec(self):
+            return QDialog.DialogCode.Accepted
+
+        def ended_at(self):
+            return corrected_end.astimezone(timezone.utc)
+
+    monkeypatch.setattr(ui_module, "FocusEndTimeDialog", FakeEndTimeDialog)
+    window = PetWindow(service)
+    try:
+        window.task_picker_open = True
+        window.refresh()
+        _flush(qt_app)
+        row = window.today_completed_list.itemWidget(window.today_completed_list.item(0))
+        assert row is not None
+        edit_button = row.findChild(QPushButton, "completedEditButton")
+        assert edit_button is not None
+        edit_button.click()
+        _flush(qt_app)
+
+        record = storage.get_completed_focus_record(session.id)
+        assert record is not None
+        assert record.ended_at == corrected_end.astimezone(timezone.utc)
+        assert record.duration_seconds == pytest.approx(4 * 60)
     finally:
         window.timer.stop()
         window.close()
@@ -496,6 +738,47 @@ def test_completed_history_delete_can_be_undone_inside_cookie_notice(qt_app, tmp
         storage.close()
 
 
+def test_completed_history_can_be_cleared_from_settings(qt_app, tmp_path, monkeypatch):
+    storage = Storage(tmp_path / "waitlab.db")
+    service = WaitLabService(storage)
+    task = storage.add_manual_task("批量清理历史")
+    now = datetime.now().astimezone().replace(microsecond=0)
+    session = storage.start_focus(task, when=now - timedelta(minutes=3))
+    storage.end_focus(session, FocusOutcome.COMPLETED, when=now)
+    window = PetWindow(service)
+    try:
+        monkeypatch.setattr(
+            QMessageBox,
+            "question",
+            staticmethod(lambda *args, **kwargs: QMessageBox.StandardButton.Yes),
+        )
+        window.show()
+        window.task_picker_open = True
+        window.refresh()
+        _flush(qt_app)
+        assert not hasattr(window, "clear_history_button")
+        assert window.today_completed_list.count() == 1
+
+        window.open_settings()
+        dialog = window.settings_dialog
+        assert dialog is not None
+        assert dialog.clear_history_button.isVisible()
+
+        dialog.clear_history_button.click()
+        _flush(qt_app)
+
+        assert storage.today_completed_tasks() == []
+        assert storage.get_completed_focus_record(session.id) is None
+        assert dialog.history_status.text() == "已清空 1 条 Waiting Task 计时记录。"
+        assert window.today_completed_list.count() == 0
+    finally:
+        if window.settings_dialog is not None:
+            window.settings_dialog.close()
+        window.timer.stop()
+        window.close()
+        storage.close()
+
+
 def test_codex_completion_actions_stay_inside_cookie_bubble(qt_app, tmp_path):
     class _FakeTray:
         def __init__(self):
@@ -528,6 +811,30 @@ def test_codex_completion_actions_stay_inside_cookie_bubble(qt_app, tmp_path):
         window.notice_pause_button.click()
         _flush(qt_app)
         assert service.focus is not None and service.focus.is_paused
+    finally:
+        window.timer.stop()
+        window.close()
+        storage.close()
+
+
+def test_codex_completion_notice_is_not_repeated_in_header_or_ai_card(
+    qt_app, tmp_path
+):
+    storage = Storage(tmp_path / "waitlab.db")
+    storage.set_setting("notification_sound", "0")
+    service = WaitLabService(storage)
+    window = PetWindow(service)
+    try:
+        window.show()
+        window.apply_update(service.on_ai_started("thread", "turn", show_task_picker=False))
+        window.apply_update(service.on_ai_finished("turn"))
+        _flush(qt_app)
+
+        assert window.notice_card.isVisible()
+        assert window.notice_title_label.text()
+        assert window.state_label.text() != window.notice_title_label.text()
+        assert not window.message_label.isVisible()
+        assert not window.ai_card.isVisible()
     finally:
         window.timer.stop()
         window.close()

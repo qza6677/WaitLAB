@@ -11,9 +11,9 @@ from PySide6.QtWidgets import QApplication
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_ROOT))
 
-from waitlab.service import WaitLabService
-from waitlab.storage import Storage
-from waitlab.ui import PetWindow
+from waitlab.service import WaitLabService  # noqa: E402
+from waitlab.storage import Storage  # noqa: E402
+from waitlab.ui import PetWindow  # noqa: E402
 
 
 def main() -> int:

@@ -24,7 +24,7 @@ class StatsSnapshot:
 
 
 class StatsCache:
-    """Cache one coherent snapshot per period for at most one second."""
+    """Cache one coherent snapshot per period for a short configurable TTL."""
 
     def __init__(
         self,

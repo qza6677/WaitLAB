@@ -9,12 +9,12 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_ROOT))
 
-from PySide6.QtGui import QFont
-from PySide6.QtWidgets import QApplication
+from PySide6.QtGui import QFont  # noqa: E402
+from PySide6.QtWidgets import QApplication  # noqa: E402
 
-from waitlab.service import WaitLabService
-from waitlab.storage import Storage
-from waitlab.ui import PetWindow
+from waitlab.service import WaitLabService  # noqa: E402
+from waitlab.storage import Storage  # noqa: E402
+from waitlab.ui import PetWindow  # noqa: E402
 
 
 def render() -> None:

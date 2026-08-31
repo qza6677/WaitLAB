@@ -116,6 +116,106 @@ def test_tags_are_persisted_and_completed_segments_can_be_deleted(tmp_path):
         storage.close()
 
 
+def test_completed_focus_end_time_shortens_segments_and_updates_task(tmp_path):
+    storage = Storage(tmp_path / "waitlab.db")
+    try:
+        now = datetime.now(timezone.utc).replace(microsecond=0)
+        started = now - timedelta(minutes=90)
+        original_end = now - timedelta(minutes=10)
+        corrected_end = now - timedelta(minutes=25)
+        task = storage.add_manual_task("可修正结束时间")
+        session = storage.start_focus(task, when=started)
+
+        session.paused_at = started + timedelta(minutes=20)
+        session.last_heartbeat_at = session.paused_at
+        storage.save_focus_pause(session)
+        session.paused_at = None
+        session.last_heartbeat_at = started + timedelta(minutes=50)
+        storage.save_focus_pause(session)
+        storage.finish_focus_and_task(session, FocusOutcome.COMPLETED, when=original_end)
+
+        assert storage.update_completed_focus_end_time(session.id, corrected_end) is True
+        record = storage.get_completed_focus_record(session.id)
+        assert record is not None
+        assert record.ended_at == corrected_end
+        assert record.duration_seconds == pytest.approx(35 * 60)
+
+        row = storage._connection.execute(
+            "SELECT ended_at, paused_seconds FROM focus_sessions WHERE id = ?",
+            (session.id,),
+        ).fetchone()
+        assert row["ended_at"] == corrected_end.isoformat()
+        assert row["paused_seconds"] == pytest.approx(30 * 60)
+        segments = storage._connection.execute(
+            """
+            SELECT started_at, ended_at FROM focus_segments
+            WHERE focus_session_id = ? ORDER BY id
+            """,
+            (session.id,),
+        ).fetchall()
+        assert len(segments) == 2
+        assert segments[0]["ended_at"] == (started + timedelta(minutes=20)).isoformat()
+        assert segments[1]["ended_at"] == corrected_end.isoformat()
+        task_row = storage._connection.execute(
+            "SELECT completed_at FROM tasks WHERE id = ?", (task.id,)
+        ).fetchone()
+        assert task_row["completed_at"] == corrected_end.isoformat()
+    finally:
+        storage.close()
+
+
+def test_completed_focus_end_time_rejects_invalid_changes_without_mutating(tmp_path):
+    storage = Storage(tmp_path / "waitlab.db")
+    try:
+        now = datetime.now(timezone.utc).replace(microsecond=0)
+        started = now - timedelta(minutes=10)
+        original_end = now - timedelta(minutes=5)
+        task = storage.add_manual_task("结束时间校验")
+        session = storage.start_focus(task, when=started)
+        storage.finish_focus_and_task(session, FocusOutcome.COMPLETED, when=original_end)
+
+        with pytest.raises(ValueError, match="早于开始"):
+            storage.update_completed_focus_end_time(session.id, started - timedelta(seconds=1))
+        with pytest.raises(ValueError, match="晚于当前"):
+            storage.update_completed_focus_end_time(session.id, now + timedelta(minutes=1))
+        with pytest.raises(ValueError, match="只能向前"):
+            storage.update_completed_focus_end_time(session.id, original_end + timedelta(seconds=1))
+
+        unchanged = storage.get_completed_focus_record(session.id)
+        assert unchanged is not None
+        assert unchanged.ended_at == original_end
+
+        open_task = storage.add_manual_task("仍在计时")
+        open_session = storage.start_focus(open_task, when=started)
+        assert storage.update_completed_focus_end_time(open_session.id, original_end) is False
+    finally:
+        storage.close()
+
+
+def test_completed_focus_end_time_can_move_record_out_of_today(tmp_path):
+    storage = Storage(tmp_path / "waitlab.db")
+    try:
+        now = datetime.now().astimezone().replace(
+            hour=0,
+            minute=30,
+            second=0,
+            microsecond=0,
+        )
+        started = now - timedelta(minutes=90)
+        original_end = now - timedelta(minutes=10)
+        corrected_end = now - timedelta(minutes=45)
+        task = storage.add_manual_task("跨日期修正")
+        session = storage.start_focus(task, when=started)
+        storage.finish_focus_and_task(session, FocusOutcome.COMPLETED, when=original_end)
+        assert len(storage.today_completed_tasks(now)) == 1
+
+        assert storage.update_completed_focus_end_time(session.id, corrected_end) is True
+        assert storage.today_completed_tasks(now) == []
+        assert storage.waiting_seconds("day", now) == pytest.approx(0)
+    finally:
+        storage.close()
+
+
 def test_tags_can_be_added_renamed_and_deleted_with_reassignment(tmp_path):
     storage = Storage(tmp_path / "waitlab.db")
     try:
@@ -295,6 +395,46 @@ def test_completed_focus_history_can_be_archived_and_restored_atomically(tmp_pat
         assert restored is not None
         assert restored.duration_seconds == pytest.approx(record.duration_seconds)
         assert storage.restore_archived_focus_session(session.id) is False
+    finally:
+        storage.close()
+
+
+def test_clear_focus_history_removes_terminal_records_but_keeps_open_focus(tmp_path):
+    storage = Storage(tmp_path / "waitlab.db")
+    try:
+        now = datetime.now(timezone.utc).replace(microsecond=0)
+
+        completed_task = storage.add_manual_task("已完成记录")
+        completed = storage.start_focus(completed_task, when=now - timedelta(minutes=8))
+        storage.end_focus(completed, FocusOutcome.COMPLETED, when=now - timedelta(minutes=7))
+
+        abandoned_task = storage.add_manual_task("已取消记录")
+        abandoned = storage.start_focus(abandoned_task, when=now - timedelta(minutes=6))
+        storage.end_focus(abandoned, FocusOutcome.ABANDONED, when=now - timedelta(minutes=5))
+
+        archived_task = storage.add_manual_task("已归档记录")
+        archived = storage.start_focus(archived_task, when=now - timedelta(minutes=4))
+        storage.end_focus(archived, FocusOutcome.COMPLETED, when=now - timedelta(minutes=3))
+        assert storage.archive_focus_session(archived.id) is True
+
+        paused_task = storage.add_manual_task("保留的暂停任务")
+        paused = storage.start_focus(paused_task, when=now - timedelta(minutes=2))
+        paused.paused_at = now - timedelta(minutes=1)
+        paused.last_heartbeat_at = paused.paused_at
+        storage.save_focus_pause(paused)
+
+        running_task = storage.add_manual_task("保留的进行中任务")
+        running = storage.start_focus(running_task, when=now - timedelta(seconds=30))
+
+        assert storage.clear_focus_history() == 3
+        assert storage.today_completed_tasks(now) == []
+        assert storage.get_completed_focus_record(completed.id) is None
+        assert storage.get_completed_focus_record(archived.id) is None
+        assert storage.get_running_focus() is not None
+        assert {session.id for session in storage.list_open_focuses()} == {paused.id, running.id}
+        assert storage._connection.execute(
+            "SELECT COUNT(*) FROM deleted_focus_sessions"
+        ).fetchone()[0] == 0
     finally:
         storage.close()
 
