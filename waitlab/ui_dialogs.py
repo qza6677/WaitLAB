@@ -27,6 +27,7 @@ from PySide6.QtWidgets import (
     QLabel,
     QLineEdit,
     QLayout,
+    QLayoutItem,
     QListWidget,
     QListWidgetItem,
     QMessageBox,
@@ -783,7 +784,8 @@ class TaskManagerDialog(QDialog):
         self.input.setPlaceholderText("输入任务；粘贴多行内容可批量添加")
         self.input.setFixedHeight(46)
         self.input.setToolTip("每行一个任务；可一次粘贴多行，按 Ctrl+Enter 或点击添加")
-        QShortcut(QKeySequence("Ctrl+Return"), self.input, activated=self._add_task)
+        add_task_shortcut = QShortcut(QKeySequence("Ctrl+Return"), self.input)
+        add_task_shortcut.activated.connect(self._add_task)
         self.manual_tag = TagPickerButton(
             self.service.available_tags(),
             DEFAULT_TAG,
@@ -1016,6 +1018,8 @@ class TaskManagerDialog(QDialog):
 
         for index in range(layout.count()):
             item = layout.itemAt(index)
+            if item is None:
+                continue
             widget = item.widget()
             if widget is not None:
                 widget.setParent(parent)
@@ -1023,12 +1027,19 @@ class TaskManagerDialog(QDialog):
                 TaskManagerDialog._reparent_layout_widgets(item.layout(), parent)
 
     @staticmethod
-    def _adopt_layout_item(item, target_layout, parent: QWidget) -> None:
+    def _adopt_layout_item(
+        item: QLayoutItem,
+        target_layout: QLayout,
+        parent: QWidget,
+    ) -> None:
         target_layout.addItem(item)
-        if item.widget() is not None:
-            item.widget().setParent(parent)
-        elif item.layout() is not None:
-            TaskManagerDialog._reparent_layout_widgets(item.layout(), parent)
+        widget = item.widget()
+        if widget is not None:
+            widget.setParent(parent)
+            return
+        child_layout = item.layout()
+        if child_layout is not None:
+            TaskManagerDialog._reparent_layout_widgets(child_layout, parent)
 
     @staticmethod
     def _configure_task_list(list_widget: QListWidget) -> None:

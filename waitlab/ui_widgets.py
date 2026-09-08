@@ -751,6 +751,7 @@ class TaskRowWidget(QWidget):
         self.tag_label.popup_requested.connect(self.tag_popup_requested.emit)
         layout.addWidget(self.tag_label, 0, Qt.AlignmentFlag.AlignVCenter)
 
+        self.meta_label: QLabel | None = None
         if meta:
             self.meta_label = QLabel(meta, self)
             self.meta_label.setObjectName("muted")
@@ -763,9 +764,6 @@ class TaskRowWidget(QWidget):
             )
             self.meta_label.setToolTip(meta)
             layout.addWidget(self.meta_label, 0, Qt.AlignmentFlag.AlignVCenter)
-        else:
-            self.meta_label = None
-
         actions = QHBoxLayout()
         actions.setContentsMargins(0, 0, 0, 0)
         actions.setSpacing(5)
