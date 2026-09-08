@@ -17,7 +17,13 @@ SCHEMA_SQL = """
                 sort_order INTEGER NOT NULL DEFAULT 0,
                 created_at TEXT NOT NULL,
                 completed_at TEXT
-                ,tag TEXT NOT NULL DEFAULT '\u672a\u5206\u7c7b'
+                ,tag TEXT NOT NULL DEFAULT '\u672a\u5206\u7c7b',
+                planned_date TEXT,
+                initial_planned_date TEXT,
+                carried_from_date TEXT,
+                rollover_count INTEGER NOT NULL DEFAULT 0,
+                priority INTEGER NOT NULL DEFAULT 0,
+                due_date TEXT
             );
 
             CREATE TABLE IF NOT EXISTS focus_sessions (
@@ -111,6 +117,20 @@ SCHEMA_SQL = """
                 key TEXT PRIMARY KEY,
                 value TEXT NOT NULL
             );
+
+            CREATE TABLE IF NOT EXISTS task_planning_events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                task_id INTEGER NOT NULL,
+                from_date TEXT NOT NULL,
+                to_date TEXT NOT NULL,
+                event_type TEXT NOT NULL DEFAULT 'reschedule',
+                created_at TEXT NOT NULL,
+                FOREIGN KEY(task_id) REFERENCES tasks(id) ON DELETE CASCADE
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_task_planning_events_task
+                ON task_planning_events(task_id, created_at, id);
+
             """
 
 
@@ -118,4 +138,3 @@ def create_base_schema(connection: sqlite3.Connection) -> None:
     """Create tables and baseline indexes without changing existing data."""
 
     connection.executescript(SCHEMA_SQL)
-

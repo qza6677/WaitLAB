@@ -39,6 +39,18 @@ def test_in_app_and_system_notifications_are_independent(tmp_path):
     storage.close()
 
 
+def test_focus_guard_minutes_round_trip_and_invalid_values_are_clamped(tmp_path):
+    storage = Storage(tmp_path / "waitlab.db")
+    Preferences(focus_guard_minutes=90).save(storage)
+    assert Preferences.load(storage).focus_guard_minutes == 90
+
+    storage.set_setting("focus_guard_minutes", "9999")
+    assert Preferences.load(storage).focus_guard_minutes == 720
+    storage.set_setting("focus_guard_minutes", "not-a-number")
+    assert Preferences.load(storage).focus_guard_minutes == 240
+    storage.close()
+
+
 def test_source_autostart_command_quotes_pythonw_and_script(tmp_path):
     python = tmp_path / "Python Folder" / "python.exe"
     python.parent.mkdir()

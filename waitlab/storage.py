@@ -11,11 +11,15 @@ from .models import (
     DefaultTaskEntry,
     CompletedTaskSummary,
     DEFAULT_TAG,
+    DailyTask,
     FocusOutcome,
     FocusSession,
     TagTimeBucket,
     Task,
+    TaskPlanningEvent,
     TaskKind,
+    from_iso,
+    local_date_key,
 )
 from .storage_schema import create_base_schema
 
@@ -109,6 +113,42 @@ class Storage:
             self._connection.execute(
                 "ALTER TABLE tasks ADD COLUMN tag TEXT NOT NULL DEFAULT '未分类'"
             )
+        if "planned_date" not in task_columns:
+            self._connection.execute("ALTER TABLE tasks ADD COLUMN planned_date TEXT")
+        if "initial_planned_date" not in task_columns:
+            self._connection.execute("ALTER TABLE tasks ADD COLUMN initial_planned_date TEXT")
+        if "carried_from_date" not in task_columns:
+            self._connection.execute("ALTER TABLE tasks ADD COLUMN carried_from_date TEXT")
+        if "rollover_count" not in task_columns:
+            self._connection.execute(
+                "ALTER TABLE tasks ADD COLUMN rollover_count INTEGER NOT NULL DEFAULT 0"
+            )
+        if "priority" not in task_columns:
+            self._connection.execute(
+                "ALTER TABLE tasks ADD COLUMN priority INTEGER NOT NULL DEFAULT 0"
+            )
+        if "due_date" not in task_columns:
+            self._connection.execute("ALTER TABLE tasks ADD COLUMN due_date TEXT")
+        # Legacy tasks had no planning date.  Their creation day is the least
+        # surprising initial date; malformed legacy timestamps fall back to
+        # the current local day so the task remains visible.
+        migration_today = local_date_key()
+        legacy_tasks = self._connection.execute(
+            "SELECT id, created_at, planned_date, initial_planned_date FROM tasks WHERE planned_date IS NULL OR initial_planned_date IS NULL"
+        ).fetchall()
+        for row in legacy_tasks:
+            created = from_iso(row["created_at"])
+            planned = row["planned_date"] or (
+                local_date_key(created) if created is not None else migration_today
+            )
+            initial = row["initial_planned_date"] or planned
+            self._connection.execute(
+                "UPDATE tasks SET planned_date = COALESCE(planned_date, ?), initial_planned_date = COALESCE(initial_planned_date, ?) WHERE id = ?",
+                (planned, initial, row["id"]),
+            )
+        self._connection.execute(
+            "CREATE INDEX IF NOT EXISTS idx_tasks_planned_status_order ON tasks(planned_date, status, sort_order, id)"
+        )
         ai_columns = {
             row["name"]
             for row in self._connection.execute("PRAGMA table_info(ai_sessions)").fetchall()
@@ -148,7 +188,7 @@ class Storage:
             """
         )
         self._migrate_default_content()
-        self._connection.execute("PRAGMA user_version = 3")
+        self._connection.execute("PRAGMA user_version = 6")
         self._connection.commit()
 
     def _migrate_default_content(self) -> None:
@@ -223,12 +263,85 @@ class Storage:
         return TaskRepository._map_legacy_default_entries(entries)
 
 
-    def add_manual_task(self, title: str, tag: str = DEFAULT_TAG) -> Task:
-        return self._tasks.add_manual_task(title, tag)
+    def add_manual_task(
+        self,
+        title: str,
+        tag: str = DEFAULT_TAG,
+        planned_date: str | datetime | None = None,
+        *,
+        priority: int = 0,
+        due_date: str | datetime | None = None,
+    ) -> Task:
+        return self._tasks.add_manual_task(
+            title,
+            tag,
+            planned_date,
+            priority=priority,
+            due_date=due_date,
+        )
 
 
     def list_manual_tasks(self) -> list[Task]:
         return self._tasks.list_manual_tasks()
+
+
+    def list_daily_tasks(
+        self,
+        planned_date: str | datetime | None = None,
+        *,
+        include_completed: bool = True,
+    ) -> list[DailyTask]:
+        return self._tasks.list_daily_tasks(planned_date, include_completed=include_completed)
+
+
+    def list_overdue_tasks(self, planned_date: str | datetime | None = None) -> list[DailyTask]:
+        return self._tasks.list_overdue_tasks(planned_date)
+
+
+    def get_daily_task(self, task_id: int) -> DailyTask | None:
+        return self._tasks.get_daily_task(task_id)
+
+
+    def list_task_planning_events(self, task_id: int) -> list[TaskPlanningEvent]:
+        return self._tasks.list_task_planning_events(task_id)
+
+
+    def update_manual_task(
+        self,
+        task_id: int,
+        title: str,
+        tag: str,
+        *,
+        priority: int = 0,
+        due_date: str | datetime | None = None,
+    ) -> Task | None:
+        return self._tasks.update_manual_task(
+            task_id,
+            title,
+            tag,
+            priority=priority,
+            due_date=due_date,
+        )
+
+
+    def set_manual_task_completed(self, task_id: int, completed: bool, when: datetime | None = None) -> bool:
+        return self._tasks.set_manual_task_completed(task_id, completed, when)
+
+
+    def carry_manual_task(self, task_id: int, planned_date: str | datetime | None = None) -> bool:
+        return self._tasks.carry_manual_task(task_id, planned_date)
+
+
+    def carry_manual_tasks(self, task_ids: list[int], planned_date: str | datetime | None = None) -> int:
+        return self._tasks.carry_manual_tasks(task_ids, planned_date)
+
+
+    def reschedule_manual_task(self, task_id: int, planned_date: str | datetime) -> bool:
+        return self._tasks.reschedule_manual_task(task_id, planned_date)
+
+
+    def reorder_manual_tasks(self, task_ids: list[int], planned_date: str | datetime | None = None) -> None:
+        self._tasks.reorder_manual_tasks(task_ids, planned_date)
 
 
     @staticmethod
@@ -238,6 +351,14 @@ class Storage:
 
     def available_tags(self) -> list[str]:
         return self._tasks.available_tags()
+
+
+    def tag_colors(self) -> dict[str, str]:
+        return self._tasks.tag_colors()
+
+
+    def set_tag_color(self, tag: str, tone: str) -> None:
+        self._tasks.set_tag_color(tag, tone)
 
 
     def _save_available_tags_uncommitted(self, tags: list[str]) -> None:
@@ -275,6 +396,9 @@ class Storage:
     def delete_manual_task(self, task_id: int) -> Task | None:
         return self._tasks.delete_manual_task(task_id)
 
+    def restore_manual_task(self, task_id: int) -> Task | None:
+        return self._tasks.restore_manual_task(task_id)
+
 
     def suggested_tasks(self, limit: int = 3) -> list[Task]:
         return self._tasks.suggested_tasks(limit)
@@ -286,6 +410,13 @@ class Storage:
 
     def default_task_entries(self) -> list[DefaultTaskEntry]:
         return self._tasks.default_task_entries()
+
+
+    def due_default_task_entries(
+        self,
+        planned_date: str | datetime | None = None,
+    ) -> list[DefaultTaskEntry]:
+        return self._tasks.due_default_task_entries(planned_date)
 
 
     def _parse_default_task_entries(self, raw: str) -> list[DefaultTaskEntry]:

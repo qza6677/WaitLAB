@@ -13,12 +13,14 @@ from .models import (
     CompletedFocusRecord,
     CompletedTaskSummary,
     DEFAULT_TAG,
+    DailyTask,
     DefaultTaskEntry,
     FocusSession,
     ServiceUpdate,
     TagTimeBucket,
     Task,
     TaskKind,
+    TaskPlanningEvent,
 )
 from .preferences import Preferences
 from .storage import Storage
@@ -80,6 +82,12 @@ class WaitLabService:
     def available_tags(self) -> list[str]:
         return self.storage.available_tags()
 
+    def tag_colors(self) -> dict[str, str]:
+        return self.storage.tag_colors()
+
+    def set_tag_color(self, tag: str, color: str) -> None:
+        self.storage.set_tag_color(tag, color)
+
     def tag_usage_counts(self) -> dict[str, int]:
         return self.storage.tag_usage_counts()
 
@@ -95,17 +103,106 @@ class WaitLabService:
     def default_task_entries(self) -> list[DefaultTaskEntry]:
         return self.storage.default_task_entries()
 
+    def due_default_task_entries(
+        self,
+        planned_date: str | datetime | None = None,
+    ) -> list[DefaultTaskEntry]:
+        return self.storage.due_default_task_entries(planned_date)
+
     def set_default_task_entries(self, entries: list[DefaultTaskEntry]) -> None:
         self.storage.set_default_task_entries(entries)
 
     def list_manual_tasks(self) -> list[Task]:
         return self.storage.list_manual_tasks()
 
-    def add_manual_task(self, title: str, tag: str = DEFAULT_TAG) -> Task:
-        return self.storage.add_manual_task(title, tag)
+    def list_daily_tasks(
+        self,
+        planned_date: str | datetime | None = None,
+        *,
+        include_completed: bool = True,
+    ) -> list[DailyTask]:
+        return self.storage.list_daily_tasks(planned_date, include_completed=include_completed)
+
+    def list_overdue_tasks(self, planned_date: str | datetime | None = None) -> list[DailyTask]:
+        return self.storage.list_overdue_tasks(planned_date)
+
+    def add_manual_task(
+        self,
+        title: str,
+        tag: str = DEFAULT_TAG,
+        planned_date: str | datetime | None = None,
+        *,
+        priority: int = 0,
+        due_date: str | datetime | None = None,
+    ) -> Task:
+        return self.storage.add_manual_task(
+            title,
+            tag,
+            planned_date,
+            priority=priority,
+            due_date=due_date,
+        )
+
+    def update_manual_task(
+        self,
+        task_id: int,
+        title: str,
+        tag: str,
+        *,
+        priority: int = 0,
+        due_date: str | datetime | None = None,
+    ) -> Task | None:
+        updated = self.storage.update_manual_task(
+            task_id,
+            title,
+            tag,
+            priority=priority,
+            due_date=due_date,
+        )
+        if updated is not None and self.focus is not None and self.focus.task.id == task_id:
+            self.focus.task = updated
+        return updated
+
+    def set_manual_task_completed(
+        self,
+        task_id: int,
+        completed: bool,
+        when: datetime | None = None,
+    ) -> bool:
+        return self.storage.set_manual_task_completed(task_id, completed, when)
+
+    def carry_manual_task(
+        self,
+        task_id: int,
+        planned_date: str | datetime | None = None,
+    ) -> bool:
+        return self.storage.carry_manual_task(task_id, planned_date)
+
+    def carry_manual_tasks(
+        self,
+        task_ids: list[int],
+        planned_date: str | datetime | None = None,
+    ) -> int:
+        return self.storage.carry_manual_tasks(task_ids, planned_date)
+
+    def reschedule_manual_task(self, task_id: int, planned_date: str | datetime) -> bool:
+        return self.storage.reschedule_manual_task(task_id, planned_date)
+
+    def list_task_planning_events(self, task_id: int) -> list[TaskPlanningEvent]:
+        return self.storage.list_task_planning_events(task_id)
+
+    def reorder_manual_tasks(
+        self,
+        task_ids: list[int],
+        planned_date: str | datetime | None = None,
+    ) -> None:
+        self.storage.reorder_manual_tasks(task_ids, planned_date)
 
     def delete_manual_task(self, task_id: int) -> Task | None:
         return self.storage.delete_manual_task(task_id)
+
+    def restore_manual_task(self, task_id: int) -> Task | None:
+        return self.storage.restore_manual_task(task_id)
 
     def today_completed_tasks(
         self,

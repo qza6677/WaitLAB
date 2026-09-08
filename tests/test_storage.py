@@ -3,7 +3,7 @@ from datetime import datetime, timedelta, timezone
 
 import pytest
 
-from waitlab.models import DEFAULT_TAG, DefaultTaskEntry, FocusOutcome, TaskKind
+from waitlab.models import DEFAULT_TAG, DefaultTaskEntry, FocusOutcome, RepeatRule, TaskKind
 from waitlab.storage import DEFAULT_TASKS, LEGACY_DEFAULT_TASKS, Storage
 
 
@@ -96,6 +96,67 @@ def test_custom_fixed_tasks_are_preserved_during_default_content_migration(tmp_p
         assert migrated.default_task_entries() == [DefaultTaskEntry("我的固定任务", False, "我的标签")]
     finally:
         migrated.close()
+
+
+def test_fixed_task_repeat_rules_are_persisted_and_filtered_by_date(tmp_path):
+    path = tmp_path / "waitlab.db"
+    storage = Storage(path)
+    try:
+        storage.set_default_task_entries(
+            [
+                DefaultTaskEntry("每天任务", True, DEFAULT_TAG, RepeatRule.DAILY.value),
+                DefaultTaskEntry("工作日任务", True, DEFAULT_TAG, RepeatRule.WEEKDAYS.value),
+                DefaultTaskEntry("周三任务", True, DEFAULT_TAG, RepeatRule.WEEKLY.value, 2),
+                DefaultTaskEntry("停用任务", False, DEFAULT_TAG, RepeatRule.DAILY.value),
+            ]
+        )
+
+        monday = storage.due_default_task_entries("2026-08-31")
+        tuesday = storage.due_default_task_entries("2026-09-01")
+        wednesday = storage.due_default_task_entries("2026-09-02")
+        saturday = storage.due_default_task_entries("2026-09-05")
+        assert [entry.title for entry in monday] == ["每天任务", "工作日任务"]
+        assert [entry.title for entry in tuesday] == ["每天任务", "工作日任务"]
+        assert [entry.title for entry in wednesday] == ["每天任务", "工作日任务", "周三任务"]
+        assert [entry.title for entry in saturday] == ["每天任务"]
+    finally:
+        storage.close()
+
+    migrated = Storage(path)
+    try:
+        entries = migrated.default_task_entries()
+        assert entries[1].repeat_rule == RepeatRule.WEEKDAYS.value
+        assert entries[2].repeat_rule == RepeatRule.WEEKLY.value
+        assert entries[2].repeat_weekday == 2
+        assert entries[0].next_execution_date is not None
+        assert entries[1].next_execution_date is not None
+        assert entries[2].next_execution_date is not None
+        assert DefaultTaskEntry("轮播", True).next_execution_date is None
+    finally:
+        migrated.close()
+
+
+def test_scheduled_fixed_task_completion_does_not_change_non_rotation_order(tmp_path):
+    storage = Storage(tmp_path / "waitlab.db")
+    try:
+        storage.set_default_task_entries(
+            [
+                DefaultTaskEntry("每天任务", True, DEFAULT_TAG, RepeatRule.DAILY.value),
+                DefaultTaskEntry("轮播任务", True, DEFAULT_TAG, RepeatRule.ROTATION.value),
+            ]
+        )
+        storage.advance_default_task("每天任务")
+        assert [entry.title for entry in storage.default_task_entries()] == [
+            "每天任务",
+            "轮播任务",
+        ]
+        storage.advance_default_task("轮播任务")
+        assert [entry.title for entry in storage.default_task_entries()] == [
+            "每天任务",
+            "轮播任务",
+        ]
+    finally:
+        storage.close()
 
 
 def test_tags_are_persisted_and_completed_segments_can_be_deleted(tmp_path):
@@ -259,6 +320,109 @@ def test_multiple_tags_can_be_deleted_atomically_with_reassignment(tmp_path):
         assert "标签二" not in storage.available_tags()
         assert all(task.tag == DEFAULT_TAG for task in storage.list_manual_tasks())
         assert all(entry.tag == DEFAULT_TAG for entry in storage.default_task_entries())
+    finally:
+        storage.close()
+
+
+def test_daily_tasks_keep_overdue_rows_until_user_chooses(tmp_path):
+    storage = Storage(tmp_path / "waitlab.db")
+    try:
+        yesterday = "2026-08-31"
+        today = "2026-09-01"
+        task = storage.add_manual_task("处理延期任务", "阅读", planned_date=yesterday)
+
+        overdue = storage.list_overdue_tasks(today)
+        assert [item.id for item in overdue] == [task.id]
+        assert storage.list_daily_tasks(today) == []
+
+        assert storage.carry_manual_task(task.id, today) is True
+        carried = storage.list_daily_tasks(today)[0]
+        assert carried.title == "处理延期任务"
+        assert carried.carried_from_date == yesterday
+        assert carried.rollover_count == 1
+        events = storage.list_task_planning_events(task.id)
+        assert len(events) == 1
+        assert events[0].event_type == "carry"
+        assert (events[0].from_date, events[0].to_date) == (yesterday, today)
+
+        assert storage.set_manual_task_completed(task.id, True) is True
+        assert storage.list_overdue_tasks(today) == []
+        assert storage.list_daily_tasks(today)[0].is_completed is True
+        assert storage.set_manual_task_completed(task.id, False) is True
+        assert storage.list_daily_tasks(today)[0].is_completed is False
+    finally:
+        storage.close()
+
+
+def test_manual_task_can_be_rescheduled_without_losing_rollover_context(tmp_path):
+    storage = Storage(tmp_path / "waitlab.db")
+    try:
+        task = storage.add_manual_task("重新安排任务", planned_date="2026-08-31")
+
+        assert storage.reschedule_manual_task(task.id, "2026-09-02") is True
+        moved = storage.get_daily_task(task.id)
+        assert moved is not None
+        assert moved.planned_date == "2026-09-02"
+        assert moved.initial_planned_date == "2026-08-31"
+        assert moved.carried_from_date == "2026-08-31"
+        assert moved.rollover_count == 1
+        events = storage.list_task_planning_events(task.id)
+        assert len(events) == 1
+        assert events[0].event_type == "reschedule"
+        assert (events[0].from_date, events[0].to_date) == ("2026-08-31", "2026-09-02")
+        assert storage.list_overdue_tasks("2026-09-01") == []
+        assert storage.list_daily_tasks("2026-09-02")[0].id == task.id
+
+        # Saving the same date is idempotent and does not inflate the count.
+        assert storage.reschedule_manual_task(task.id, "2026-09-02") is True
+        assert storage.get_daily_task(task.id).rollover_count == 1
+    finally:
+        storage.close()
+
+
+def test_manual_task_priority_and_due_date_are_persisted_and_updated(tmp_path):
+    storage = Storage(tmp_path / "waitlab.db")
+    try:
+        task = storage.add_manual_task(
+            "带截止日期的任务",
+            planned_date="2026-09-01",
+            priority=3,
+            due_date="2026-09-05",
+        )
+        assert task.priority == 3
+        assert task.due_date == "2026-09-05"
+        daily = storage.get_daily_task(task.id)
+        assert daily is not None
+        assert daily.priority == 3
+        assert daily.due_date == "2026-09-05"
+
+        updated = storage.update_manual_task(
+            task.id,
+            "已调整的任务",
+            DEFAULT_TAG,
+            priority=1,
+            due_date=None,
+        )
+        assert updated is not None
+        assert updated.priority == 1
+        assert updated.due_date is None
+        assert storage.get_daily_task(task.id).due_date is None
+    finally:
+        storage.close()
+
+
+def test_tag_colors_are_persisted_and_follow_rename(tmp_path):
+    storage = Storage(tmp_path / "waitlab.db")
+    try:
+        storage.add_tag("颜色测试")
+        storage.set_tag_color("颜色测试", "red")
+        assert storage.tag_colors()["颜色测试"] == "red"
+        storage.set_tag_color("颜色测试", "#7A42D8")
+        assert storage.tag_colors()["颜色测试"] == "#7A42D8"
+        storage.rename_tag("颜色测试", "颜色改名")
+        assert storage.tag_colors()["颜色改名"] == "#7A42D8"
+        storage.delete_tag("颜色改名")
+        assert "颜色改名" not in storage.tag_colors()
     finally:
         storage.close()
 

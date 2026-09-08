@@ -18,14 +18,17 @@ from .models import DEFAULT_TAG
 
 
 COLORS = {
-    "ink": "#203133",
-    "muted": "#748183",
-    "cream": "#FFF9EF",
-    "mint": "#63B89C",
-    "mint_dark": "#367D69",
-    "peach": "#F3A77C",
-    "yellow": "#F6C85F",
-    "line": "#E9E2D7",
+    # Keep the friendly green identity, but move the working surface toward
+    # a neutral warm gray.  The former cream/muted pair made secondary copy
+    # and thin borders disappear on common Windows displays.
+    "ink": "#24332F",
+    "muted": "#5E6D66",
+    "cream": "#F6F7F4",
+    "mint": "#78B99A",
+    "mint_dark": "#286B55",
+    "peach": "#D58B63",
+    "yellow": "#D6AA46",
+    "line": "#DCE3DD",
     "white": "#FFFFFF",
 }
 
@@ -38,6 +41,8 @@ TAG_TONES: tuple[tuple[str, str, str], ...] = (
     ("red", "#9B4F50", "#FDE8E7"),
     ("slate", "#53636C", "#EDF1F3"),
 )
+TAG_TONE_FOREGROUNDS = {name: foreground for name, foreground, _background in TAG_TONES}
+TAG_TONE_BACKGROUNDS = {name: background for name, _foreground, background in TAG_TONES}
 TAG_TONE_BY_NAME = {
     DEFAULT_TAG: "slate",
     "\u5199\u4f5c": "purple",
@@ -67,6 +72,60 @@ def tag_tone_colors(tone: str) -> tuple[str, str]:
         if name == tone:
             return foreground, background
     return TAG_TONES[-1][1:]
+
+
+def _coerce_tag_color(value: str | None) -> QColor | None:
+    """Return a valid custom tag color, or ``None`` for legacy tone names."""
+
+    clean = str(value or "").strip()
+    if not clean.startswith("#"):
+        return None
+    color = QColor(clean)
+    return color if color.isValid() else None
+
+
+def tag_palette_for_color(value: str | None) -> tuple[str, str, str, str]:
+    """Return accent, foreground, soft background, and border colors.
+
+    Stored tag colors used to be named tones.  They remain accepted here, so
+    old databases and user-defined HEX colors render through one palette API.
+    """
+
+    custom = _coerce_tag_color(value)
+    if custom is None:
+        tone = str(value or "slate").strip()
+        accent, background = tag_tone_colors(tone)
+        border = QColor(accent).lighter(138).name()
+        return accent, accent, background, border
+
+    accent = custom.name().upper()
+    luminance = (
+        0.299 * custom.red()
+        + 0.587 * custom.green()
+        + 0.114 * custom.blue()
+    )
+    foreground = "#FFFFFF" if luminance < 150 else "#203133"
+    soft = QColor(custom)
+    soft = QColor(
+        round(custom.red() * 0.14 + 255 * 0.86),
+        round(custom.green() * 0.14 + 255 * 0.86),
+        round(custom.blue() * 0.14 + 255 * 0.86),
+    )
+    border = custom.lighter(125).name().upper()
+    return accent, foreground, soft.name().upper(), border
+
+
+def tag_palette_for_tag(
+    tag: str,
+    color_map: dict[str, str] | None = None,
+) -> tuple[str, str, str, str]:
+    """Return a tag palette using a persisted override when available."""
+
+    overrides = color_map or {}
+    value = overrides.get(tag)
+    if value is None:
+        value = tag_tone(tag)
+    return tag_palette_for_color(value)
 
 
 def tag_chip_stylesheet() -> str:
@@ -121,11 +180,16 @@ def chart_duration(seconds: float) -> str:
     return f"{value:.0f} \u79d2"
 
 
-def chart_color(tag: str, *, soft: bool = False) -> QColor:
+def chart_color(
+    tag: str,
+    *,
+    soft: bool = False,
+    color_map: dict[str, str] | None = None,
+) -> QColor:
     """Return the foreground or soft background color for a tag."""
 
-    foreground, background = tag_tone_colors(tag_tone(tag))
-    return QColor(background if soft else foreground)
+    accent, _foreground, background, _border = tag_palette_for_tag(tag, color_map)
+    return QColor(background if soft else accent)
 
 
 def app_icon(size: int = 64) -> QIcon:

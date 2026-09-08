@@ -14,6 +14,7 @@ from PySide6.QtCore import (
     Signal,
 )
 from PySide6.QtGui import (
+    QAction,
     QColor,
     QKeyEvent,
     QMouseEvent,
@@ -35,6 +36,8 @@ from PySide6.QtWidgets import (
     QScrollArea,
     QSizePolicy,
     QSystemTrayIcon,
+    QStyle,
+    QToolButton,
     QVBoxLayout,
     QWidget,
 )
@@ -50,8 +53,10 @@ from .models import (
     CompletedTaskSummary,
     CompletedFocusRecord,
     DefaultTaskEntry,
+    FocusSession,
     ServiceUpdate,
     Task,
+    local_date_key,
 )
 from .preferences import PopupMode, Preferences
 from .service import AI_INITIAL_PROMPT_GRACE_SECONDS, WaitLabService
@@ -120,8 +125,13 @@ class PetWindow(QWidget):
         self._notice_title = ""
         self._notice_body = ""
         self._notice_level = "info"
+        self._daily_prompt_active = False
+        self._daily_prompt_deferred = False
         self._deleted_history_record: CompletedFocusRecord | None = None
         self._deleted_history_until = 0.0
+        self._focus_guard_notice_session_id: int | None = None
+        self._focus_guard_active = False
+        self._focus_guard_minutes = 0
         self.last_message = "等待下一次 Codex 指令"
         self._drag_origin: QPoint | None = None
         self.hook_monitor = HookConnectionMonitor(service)
@@ -140,6 +150,10 @@ class PetWindow(QWidget):
         self._focus_full_title = ""
         self._state_full_title = ""
         self._fit_to_content_pending = False
+        # The top-level window changes presentation modes frequently.  Keep
+        # one desired width and let the geometry helper apply the final size
+        # without creating transient min/max constraints.
+        self._desired_window_width = 82
         self._last_calendar_day = time.localtime()[:3]
 
         self.setWindowTitle("WaitLAB")
@@ -149,7 +163,9 @@ class PetWindow(QWidget):
             | Qt.WindowType.Tool
         )
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
-        self.setFixedWidth(82)
+        self.setMinimumSize(QSize(0, 0))
+        self.setMaximumSize(QSize(16_777_215, 16_777_215))
+        self.resize(82, 82)
         self._build_ui()
         self.update_check_finished.connect(self._show_update_result)
         self.update_available.connect(self._offer_update)
@@ -221,7 +237,7 @@ class PetWindow(QWidget):
         title_row.addWidget(self.state_label, 1)
         tasks_button = QPushButton("任务")
         tasks_button.setObjectName("ghostButton")
-        tasks_button.setToolTip("管理手动任务和固定循环任务")
+        tasks_button.setToolTip("安排今日任务，管理过往任务和循环任务")
         tasks_button.clicked.connect(self.open_task_manager)
         settings_button = QPushButton("设置")
         settings_button.setObjectName("ghostButton")
@@ -271,7 +287,9 @@ class PetWindow(QWidget):
         focus_shadow.setBlurRadius(18)
         focus_shadow.setOffset(0, 4)
         focus_shadow.setColor(QColor(40, 55, 50, 35))
-        self.focus_card.setGraphicsEffect(focus_shadow)
+        # The panel itself provides the elevation; an inner card shadow makes
+        # the player look like a second window stacked on top of it.
+        self.focus_card.setGraphicsEffect(None)
         focus_layout = QVBoxLayout(self.focus_card)
         focus_layout.setContentsMargins(14, 12, 14, 12)
         focus_layout.setSpacing(7)
@@ -287,12 +305,7 @@ class PetWindow(QWidget):
         self.focus_title.setMinimumWidth(0)
         self.focus_title.setMinimumHeight(22)
         self.focus_title.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
-        self.focus_time = QLabel("00:00")
-        self.focus_time.setObjectName("timerCompact")
-        self.focus_time.setMinimumWidth(72)
-        self.focus_time.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
         focus_info.addWidget(self.focus_title, 1)
-        focus_info.addWidget(self.focus_time, 0)
         self.focus_hide_button = QPushButton("−")
         self.focus_hide_button.setObjectName("iconButton")
         self.focus_hide_button.setFixedSize(24, 24)
@@ -301,37 +314,91 @@ class PetWindow(QWidget):
         focus_info.addWidget(self.focus_hide_button, 0)
         focus_layout.addLayout(focus_info)
 
+        focus_meta = QHBoxLayout()
+        focus_meta.setContentsMargins(0, 0, 0, 0)
+        focus_meta.setSpacing(8)
+        self.focus_tag = QLabel()
+        self.focus_tag.setObjectName("sourcePill")
+        self.focus_tag.setVisible(False)
+        focus_meta.addWidget(self.focus_tag, 0)
+        focus_meta.addStretch(1)
+        self.focus_time = QLabel("00:00")
+        self.focus_time.setObjectName("timerLarge")
+        self.focus_time.setMinimumWidth(96)
+        self.focus_time.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        focus_meta.addWidget(self.focus_time, 0)
+        focus_layout.addLayout(focus_meta)
+
         controls = QHBoxLayout()
         controls.setContentsMargins(0, 0, 0, 0)
-        controls.setSpacing(6)
-        self.pause_button = QPushButton("Ⅱ\n暂停")
+        controls.setSpacing(4)
+        self.pause_button = QPushButton("暂停")
         self.pause_button.setObjectName("playerButton")
-        self.pause_button.setToolTip("暂停或继续微任务")
+        self.pause_button.setIcon(self.style().standardIcon(QStyle.StandardPixmap.SP_MediaPause))
+        self.pause_button.setToolTip("暂停或继续任务")
         self.pause_button.clicked.connect(self.toggle_pause)
-        self.switch_button = QPushButton("↔\n切换")
+        self.pause_button.setIconSize(QSize(16, 16))
+
+        self.switch_button = QPushButton("切换", self.focus_card)
         self.switch_button.setObjectName("playerSwitchButton")
+        self.switch_button.setIcon(self.style().standardIcon(QStyle.StandardPixmap.SP_BrowserReload))
+        self.switch_button.setIconSize(QSize(16, 16))
         self.switch_button.setToolTip("暂停当前任务后切换到另一个任务")
         self.switch_button.clicked.connect(self.open_task_switcher)
-        complete_button = QPushButton("✓\n完成")
-        complete_button.setObjectName("playerPrimaryButton")
-        complete_button.setToolTip("完成当前微任务")
-        complete_button.clicked.connect(self.complete_focus)
-        abandon_button = QPushButton("×\n取消")
-        abandon_button.setObjectName("playerCloseButton")
-        abandon_button.setToolTip("取消本次计时并放回任务池")
-        abandon_button.clicked.connect(self.abandon_focus)
-        for button in (self.pause_button, complete_button, abandon_button):
-            button.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
-            button.setMinimumSize(88, 44)
+        self.switch_button.setVisible(False)
+        self.complete_button = QPushButton("完成")
+        self.complete_button.setObjectName("playerPrimaryButton")
+        self.complete_button.setIcon(self.style().standardIcon(QStyle.StandardPixmap.SP_DialogApplyButton))
+        self.complete_button.setIconSize(QSize(16, 16))
+        self.complete_button.setToolTip("完成当前任务")
+        self.complete_button.clicked.connect(self.complete_focus)
+        self.abandon_button = QPushButton("放回", self.focus_card)
+        self.abandon_button.setObjectName("playerCloseButton")
+        self.abandon_button.setIcon(self.style().standardIcon(QStyle.StandardPixmap.SP_DialogCancelButton))
+        self.abandon_button.setIconSize(QSize(16, 16))
+        self.abandon_button.setToolTip("取消本次计时并放回任务池")
+        self.abandon_button.clicked.connect(self.abandon_focus)
+        self.abandon_button.setVisible(False)
+
+        self.player_more_button = QToolButton(self.focus_card)
+        self.player_more_button.setObjectName("playerMoreButton")
+        self.player_more_button.setText("隐藏面板")
+        self.player_more_button.setToolTip("隐藏面板，仅保留 Cookie")
+        self.player_more_button.clicked.connect(self.hide_page)
+        self.player_more_button.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextBesideIcon)
+        self.player_more_button.setIcon(
+            self.style().standardIcon(QStyle.StandardPixmap.SP_TitleBarMinButton)
+        )
+        self.player_more_button.setIconSize(QSize(12, 12))
+        self.player_more_button.setFixedSize(90, 20)
+
+        # Keep QAction handles for integrations and keyboard/menu callers;
+        # common actions are now visible in the player itself.
+        self.player_more_menu = QMenu(self)
+        self.switch_action = QAction("切换任务", self)
+        self.switch_action.triggered.connect(self.open_task_switcher)
+        self.switch_action.setEnabled(False)
+        self.cancel_action = QAction("取消本次计时", self)
+        self.cancel_action.triggered.connect(self.abandon_focus)
+        self.hide_action = QAction("隐藏面板", self)
+        self.hide_action.triggered.connect(self.hide_page)
+
+        self.pause_button.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
+        self.pause_button.setFixedSize(84, 44)
         self.switch_button.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
-        self.switch_button.setFixedWidth(72)
-        controls.addWidget(self.pause_button, 1)
+        self.switch_button.setFixedSize(72, 44)
+        self.complete_button.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        self.complete_button.setMinimumSize(96, 44)
+        self.abandon_button.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
+        self.abandon_button.setFixedSize(72, 44)
+        controls.addWidget(self.pause_button, 0)
+        controls.addWidget(self.complete_button, 1)
         controls.addWidget(self.switch_button, 0)
-        controls.addWidget(complete_button, 1)
-        controls.addWidget(abandon_button, 1)
+        controls.addWidget(self.abandon_button, 0)
         self.focus_controls = QWidget(self.focus_card)
         self.focus_controls.setLayout(controls)
         focus_layout.addWidget(self.focus_controls)
+        focus_layout.addWidget(self.player_more_button, 0, Qt.AlignmentFlag.AlignRight)
         header.addWidget(self.focus_card, 1)
         layout.addLayout(header)
 
@@ -351,31 +418,72 @@ class PetWindow(QWidget):
         self.picker.setObjectName("picker")
         self.picker.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Maximum)
         picker_layout = QVBoxLayout(self.picker)
-        picker_layout.setContentsMargins(2, 1, 2, 0)
-        picker_layout.setSpacing(2)
+        picker_layout.setContentsMargins(16, 14, 16, 12)
+        picker_layout.setSpacing(0)
         picker_header = QHBoxLayout()
-        picker_header.setSpacing(3)
-        self.picker_title = QLabel("选一个等待任务")
+        picker_header.setSpacing(8)
+        self.picker_title = QLabel("选一件事，开始专注")
         self.picker_title.setObjectName("sectionTitle")
         self.picker_source = QLabel()
         self.picker_source.setObjectName("sourcePill")
         picker_header.addWidget(self.picker_title)
         picker_header.addStretch()
+        self.picker_all_button = QPushButton("全部任务")
+        self.picker_all_button.setObjectName("ghostButton")
+        self.picker_all_button.setToolTip("打开今日任务和循环任务")
+        self.picker_all_button.clicked.connect(self.open_task_manager)
         picker_header.addWidget(self.picker_source)
         picker_layout.addLayout(picker_header)
         self.home_stats_label = QLabel("今天 · Waiting Task 00:00")
         self.home_stats_label.setObjectName("muted")
         picker_layout.addWidget(self.home_stats_label)
-        task_input_row = QHBoxLayout()
-        task_input_row.setSpacing(4)
-        self.quick_task_input = QLineEdit()
-        self.quick_task_input.setPlaceholderText("新增一个具体任务…")
-        self.quick_task_input.returnPressed.connect(self._add_quick_task)
-        task_input_row.addWidget(self.quick_task_input)
-        picker_layout.addLayout(task_input_row)
 
-        add_row = QHBoxLayout()
-        add_row.setSpacing(4)
+        today_section = QHBoxLayout()
+        today_section.setContentsMargins(0, 4, 0, 0)
+        today_section.setSpacing(4)
+        today_section_label = QLabel("今日任务")
+        today_section_label.setObjectName("muted")
+        today_section.addWidget(today_section_label)
+        today_section.addStretch()
+        today_section.addWidget(self.picker_all_button)
+        picker_layout.addLayout(today_section)
+
+        self.suggestion_container = QWidget()
+        self.suggestion_container.setSizePolicy(
+            QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Maximum
+        )
+        self.suggestion_layout = QVBoxLayout(self.suggestion_container)
+        self.suggestion_layout.setContentsMargins(0, 0, 0, 0)
+        self.suggestion_layout.setSpacing(0)
+        picker_layout.addWidget(self.suggestion_container)
+
+        self.quick_compose = QFrame()
+        self.quick_compose.setObjectName("quickCompose")
+        self.quick_compose.setSizePolicy(
+            QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Maximum
+        )
+        compose_layout = QVBoxLayout(self.quick_compose)
+        compose_layout.setContentsMargins(10, 8, 10, 8)
+        compose_layout.setSpacing(6)
+        task_input_row = QHBoxLayout()
+        task_input_row.setSpacing(0)
+        self.quick_task_input = QLineEdit()
+        self.quick_task_input.setPlaceholderText("添加一件具体的小事…")
+        # Enter has the least surprising behaviour: save the task to today.
+        # Starting a timer is an explicit second action in the picker.
+        self.quick_task_input.returnPressed.connect(
+            lambda: self._add_quick_task(start=False)
+        )
+        task_input_row.addWidget(self.quick_task_input)
+        compose_layout.addLayout(task_input_row)
+        self.quick_task_error = QLabel()
+        self.quick_task_error.setObjectName("validationError")
+        self.quick_task_error.setWordWrap(True)
+        self.quick_task_error.hide()
+        compose_layout.addWidget(self.quick_task_error)
+
+        tag_row = QHBoxLayout()
+        tag_row.setSpacing(6)
         quick_tag_label = QLabel("标签")
         quick_tag_label.setObjectName("muted")
         self.quick_task_tag = TagChipBar(
@@ -397,35 +505,84 @@ class PetWindow(QWidget):
             Qt.ScrollBarPolicy.ScrollBarAlwaysOff
         )
         self.quick_task_tag_scroll.setWidget(self.quick_task_tag)
-        add_quick = QPushButton("新增")
-        add_quick.clicked.connect(self._add_quick_task)
-        add_row.addWidget(quick_tag_label)
-        add_row.addWidget(self.quick_task_tag_scroll, 1)
+        self.quick_task_tag_scroll.setFixedHeight(28)
+        # Keep the tag selector a deliberate horizontal strip. Long tag sets
+        # scroll inside it instead of stealing width from the compose actions.
+        self.quick_task_tag_scroll.setMaximumWidth(180)
+        tag_row.addWidget(quick_tag_label)
+        tag_row.addWidget(self.quick_task_tag_scroll, 1)
+        compose_layout.addLayout(tag_row)
+
+        add_row = QHBoxLayout()
+        add_row.setContentsMargins(0, 0, 0, 0)
+        add_row.setSpacing(6)
+        self.quick_add_button = QPushButton("添加到今天")
+        self.quick_add_button.setObjectName("secondaryButton")
+        self.quick_add_button.setToolTip("只添加任务，不开始计时")
+        self.quick_add_button.clicked.connect(
+            lambda: self._add_quick_task(start=False)
+        )
+        self.quick_add_start_button = QPushButton("添加并开始")
+        self.quick_add_start_button.setObjectName("primaryButton")
+        self.quick_add_start_button.setToolTip("添加任务并立即开始计时")
+        self.quick_add_start_button.clicked.connect(
+            lambda: self._add_quick_task(start=True)
+        )
         add_row.addStretch()
-        add_row.addWidget(add_quick)
-        picker_layout.addLayout(add_row)
-        self.random_task_button = QPushButton("随机开始一个固定任务")
-        self.random_task_button.setObjectName("secondaryButton")
+        add_row.addWidget(self.quick_add_button)
+        add_row.addWidget(self.quick_add_start_button)
+        compose_layout.addLayout(add_row)
+        picker_layout.addWidget(self.quick_compose)
+        # Task creation belongs to TaskManagerDialog. Keep the old controls
+        # as an off-screen compatibility host for keyboard/integration calls,
+        # but never render a second creation surface in the picker.
+        self.quick_compose.hide()
+
+        # The cycle section is inserted into the recommendation list directly
+        # before its fixed tasks, so the heading, choices and random action
+        # read as one coherent block.
+        self.cycle_header = QWidget(self.suggestion_container)
+        cycle_row = QHBoxLayout(self.cycle_header)
+        cycle_row.setContentsMargins(0, 6, 0, 1)
+        cycle_row.setSpacing(6)
+        self.cycle_header_label = QLabel("循环任务")
+        self.cycle_header_label.setObjectName("muted")
+        cycle_row.addWidget(self.cycle_header_label)
+        self.cycle_choices_scroll = QScrollArea(self.cycle_header)
+        self.cycle_choices_scroll.setObjectName("cycleChoicesScroll")
+        self.cycle_choices_scroll.setFrameShape(QFrame.Shape.NoFrame)
+        self.cycle_choices_scroll.setWidgetResizable(False)
+        self.cycle_choices_scroll.setHorizontalScrollBarPolicy(
+            Qt.ScrollBarPolicy.ScrollBarAsNeeded
+        )
+        self.cycle_choices_scroll.setVerticalScrollBarPolicy(
+            Qt.ScrollBarPolicy.ScrollBarAlwaysOff
+        )
+        self.cycle_choices_scroll.setFixedHeight(34)
+        self.cycle_choices_widget = QWidget()
+        self.cycle_choices_layout = QHBoxLayout(self.cycle_choices_widget)
+        self.cycle_choices_layout.setContentsMargins(0, 0, 0, 0)
+        self.cycle_choices_layout.setSpacing(2)
+        self.cycle_choices_scroll.setWidget(self.cycle_choices_widget)
+        cycle_row.addWidget(self.cycle_choices_scroll, 1)
+        self.random_task_button = QPushButton("随机开始")
+        self.random_task_button.setObjectName("cycleLinkButton")
+        self.random_task_button.setFixedHeight(28)
         self.random_task_button.setCursor(Qt.CursorShape.PointingHandCursor)
         self.random_task_button.clicked.connect(self._start_random_task)
-        picker_layout.addWidget(self.random_task_button)
-        self.enable_fixed_tasks_button = QPushButton("启用固定任务")
+        cycle_row.addWidget(self.random_task_button)
+        self.cycle_header.hide()
+        self.enable_fixed_tasks_button = QPushButton("启用循环任务")
         self.enable_fixed_tasks_button.setObjectName("secondaryButton")
+        self.enable_fixed_tasks_button.setFixedHeight(28)
         self.enable_fixed_tasks_button.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.enable_fixed_tasks_button.setToolTip("启用当前任务池中的固定循环任务")
+        self.enable_fixed_tasks_button.setToolTip("启用当前任务池中的循环任务")
         self.enable_fixed_tasks_button.clicked.connect(self._enable_fixed_tasks)
         self.enable_fixed_tasks_button.hide()
         picker_layout.addWidget(self.enable_fixed_tasks_button)
-        self.suggestion_container = QWidget()
-        self.suggestion_container.setSizePolicy(
-            QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Maximum
-        )
-        self.suggestion_layout = QVBoxLayout(self.suggestion_container)
-        self.suggestion_layout.setContentsMargins(0, 0, 0, 0)
-        self.suggestion_layout.setSpacing(1)
-        picker_layout.addWidget(self.suggestion_container)
         completed_header = QLabel("今日已完成")
         completed_header.setObjectName("muted")
+        completed_header.setContentsMargins(0, 4, 0, 0)
         picker_layout.addWidget(completed_header)
         self.today_completed_list = QListWidget()
         self.today_completed_list.setObjectName("todayCompletedList")
@@ -456,19 +613,38 @@ class PetWindow(QWidget):
         layout.addWidget(self.picker)
 
         self.footer_widget = QWidget()
+        self.footer_widget.setObjectName("footerWidget")
         footer = QHBoxLayout(self.footer_widget)
-        footer.setContentsMargins(0, 0, 0, 0)
+        footer.setContentsMargins(14, 9, 14, 9)
+        footer.setSpacing(6)
+        self.footer_status_dot = QLabel("●")
+        self.footer_status_dot.setObjectName("statusDot")
+        self.footer_state_label = QLabel("Codex 正在工作")
+        self.footer_state_label.setObjectName("footerStatus")
+        self.footer_state_label.setSizePolicy(
+            QSizePolicy.Policy.Expanding,
+            QSizePolicy.Policy.Fixed,
+        )
+        footer.addWidget(self.footer_status_dot, 0)
+        footer.addWidget(self.footer_state_label, 1)
+        # The connection pill is part of the status footer in the reference
+        # layout. Keep the same widget so its detail dialog remains intact.
+        meta_row.removeWidget(self.connection_status_button)
+        self.connection_status_button.setParent(self.footer_widget)
+        footer.addWidget(self.connection_status_button, 0)
         start_ai = QPushButton("手动开始等待")
         start_ai.setObjectName("ghostButton")
         start_ai.clicked.connect(self.manual_ai_start)
         finish_ai = QPushButton("AI 已完成")
         finish_ai.setObjectName("ghostButton")
         finish_ai.clicked.connect(self.manual_ai_finish)
-        self.today_label = QLabel("今日回收 0 分钟")
+        self.today_label = QLabel("今日专注 0 分钟")
         self.today_label.setObjectName("muted")
-        footer.addWidget(start_ai)
-        footer.addWidget(finish_ai)
-        footer.addStretch()
+        # Manual Codex controls remain available from the Cookie context menu
+        # and hotkeys; the visible footer is reserved for status and totals.
+        start_ai.hide()
+        finish_ai.hide()
+        footer.addStretch(1)
         footer.addWidget(self.today_label)
         layout.addWidget(self.footer_widget)
 
@@ -487,8 +663,42 @@ class PetWindow(QWidget):
         bubble_shadow.setColor(QColor(40, 55, 50, 48))
         self.bubble_card.setGraphicsEffect(bubble_shadow)
         bubble_layout = QVBoxLayout(self.bubble_card)
-        bubble_layout.setContentsMargins(13, 6, 13, 6)
-        bubble_layout.setSpacing(2)
+        bubble_layout.setContentsMargins(0, 0, 0, 0)
+        bubble_layout.setSpacing(0)
+        self.bubble_layout = bubble_layout
+
+        self.chrome_widget = QWidget(self.bubble_card)
+        self.chrome_widget.setObjectName("chromeWidget")
+        chrome_layout = QHBoxLayout(self.chrome_widget)
+        chrome_layout.setContentsMargins(16, 10, 16, 10)
+        chrome_layout.setSpacing(6)
+        self.chrome_brand_label = QLabel("WaitLAB")
+        self.chrome_brand_label.setObjectName("chromeBrand")
+        chrome_layout.addWidget(self.chrome_brand_label, 1)
+        self.chrome_task_button = QPushButton("任务管理")
+        self.chrome_task_button.setObjectName("chromeButton")
+        self.chrome_task_button.setToolTip("管理今日任务和循环任务")
+        self.chrome_task_button.clicked.connect(self.open_task_manager)
+        chrome_layout.addWidget(self.chrome_task_button, 0)
+        self.chrome_more_button = QToolButton(self.chrome_widget)
+        self.chrome_more_button.setObjectName("chromeButton")
+        self.chrome_more_button.setText("更多")
+        self.chrome_more_button.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
+        self.chrome_more_button.setToolTip("统计、设置和连接信息")
+        chrome_menu = QMenu(self.chrome_more_button)
+        chrome_menu.addAction("统计", self.open_statistics)
+        chrome_menu.addAction("设置", self.open_settings)
+        chrome_menu.addAction("Codex 连接", self.show_codex_connection_info)
+        chrome_menu.addSeparator()
+        chrome_menu.addAction("检查更新", self.check_for_updates)
+        self.chrome_more_button.setMenu(chrome_menu)
+        chrome_layout.addWidget(self.chrome_more_button, 0)
+        self.chrome_collapse_button = QPushButton("收起")
+        self.chrome_collapse_button.setObjectName("chromeButton")
+        self.chrome_collapse_button.setToolTip("收起面板，仅保留 Cookie")
+        self.chrome_collapse_button.clicked.connect(self.hide_page)
+        chrome_layout.addWidget(self.chrome_collapse_button, 0)
+        bubble_layout.addWidget(self.chrome_widget)
         self.notice_card = QFrame()
         self.notice_card.setObjectName("noticeCard")
         self.notice_card.setProperty("level", "info")
@@ -520,10 +730,18 @@ class PetWindow(QWidget):
         self.notice_undo_button = QPushButton("撤销删除")
         self.notice_undo_button.setObjectName("noticeActionButton")
         self.notice_undo_button.clicked.connect(self._undo_deleted_history)
+        self.daily_plan_start_button = QPushButton("开始")
+        self.daily_plan_start_button.setObjectName("noticePrimaryActionButton")
+        self.daily_plan_start_button.clicked.connect(self._start_daily_planning)
+        self.daily_plan_skip_button = QPushButton("跳过")
+        self.daily_plan_skip_button.setObjectName("noticeActionButton")
+        self.daily_plan_skip_button.clicked.connect(self._skip_daily_planning)
         self.notice_action_row.addWidget(self.notice_continue_button)
         self.notice_action_row.addWidget(self.notice_pause_button)
         self.notice_action_row.addWidget(self.notice_complete_button)
         self.notice_action_row.addWidget(self.notice_undo_button)
+        self.notice_action_row.addWidget(self.daily_plan_start_button)
+        self.notice_action_row.addWidget(self.daily_plan_skip_button)
         self.notice_action_row.addStretch()
         notice_text.addLayout(self.notice_action_row)
         self.notice_action_row.setEnabled(False)
@@ -540,6 +758,8 @@ class PetWindow(QWidget):
         self.notice_pause_button.hide()
         self.notice_complete_button.hide()
         self.notice_undo_button.hide()
+        self.daily_plan_start_button.hide()
+        self.daily_plan_skip_button.hide()
         bubble_layout.addWidget(self.notice_card)
         self.compact_timer_label = QLabel("00:00")
         self.compact_timer_label.setObjectName("compactTimer")
@@ -561,6 +781,10 @@ class PetWindow(QWidget):
         ):
             widget.setParent(self.bubble_card)
             bubble_layout.addWidget(widget)
+        # Keep the legacy state/action host available for integrations, but
+        # render the visible chrome and status only once in their new slots.
+        self.header_details.hide()
+        self.header_details.setFixedHeight(0)
         header.addWidget(self.bubble_card, 1)
 
     def set_tray(self, tray: QSystemTrayIcon) -> None:
@@ -580,6 +804,7 @@ class PetWindow(QWidget):
     ) -> None:
         """Show a short-lived notification inside Cookie's operation bubble."""
 
+        self._daily_prompt_active = False
         self._notice_title = str(title).strip()
         self._notice_body = str(body).strip()
         self._notice_level = level if level in {"info", "success", "warning", "error"} else "info"
@@ -594,6 +819,50 @@ class PetWindow(QWidget):
         if sound:
             self._play_notification_sound(self.service.load_preferences())
         self.refresh()
+
+    def maybe_show_daily_planning_prompt(self) -> None:
+        """Offer one daily planning action inside Cookie's existing bubble."""
+
+        if self._daily_prompt_active:
+            return
+        today = local_date_key()
+        if self.service.get_setting("daily_planning_prompt_date", "") == today:
+            return
+        overdue_count = len(self.service.list_overdue_tasks(today))
+        self._daily_prompt_active = True
+        self._notice_title = "开始制定今天的任务吧？"
+        self._notice_body = (
+            f"还有 {overdue_count} 项过往任务待处理，可以先选择完成或延续到今天。"
+            if overdue_count
+            else "把今天要做的任务列出来，等待 Codex 时就能直接开始。"
+        )
+        self._notice_level = "info"
+        self._notice_until = time.monotonic() + 24 * 60 * 60
+        self.notice_title_label.setText(self._notice_title)
+        self.notice_body_label.setText(self._notice_body)
+        self._hide_notice_actions()
+        self.daily_plan_start_button.show()
+        self.daily_plan_skip_button.show()
+        self.notice_action_row.setEnabled(True)
+        self.notice_card.setProperty("level", "info")
+        self.notice_card.style().unpolish(self.notice_card)
+        self.notice_card.style().polish(self.notice_card)
+        self.notice_card.show()
+        self.refresh()
+
+    def _finish_daily_planning_prompt(self, *, open_manager: bool) -> None:
+        today = local_date_key()
+        self.service.set_setting("daily_planning_prompt_date", today)
+        self._daily_prompt_active = False
+        self.dismiss_notice()
+        if open_manager:
+            self.open_task_manager()
+
+    def _start_daily_planning(self) -> None:
+        self._finish_daily_planning_prompt(open_manager=True)
+
+    def _skip_daily_planning(self) -> None:
+        self._finish_daily_planning_prompt(open_manager=False)
 
     def _enqueue_completion_reminder(self, update: ServiceUpdate) -> None:
         """Queue one completion notice per Codex turn.
@@ -619,6 +888,16 @@ class PetWindow(QWidget):
         self._show_next_completion_reminder()
 
     def _show_next_completion_reminder(self) -> None:
+        # Daily planning is useful context, but it must never occupy the only
+        # notice slot when a Codex turn has reached a terminal state. Preserve
+        # it as a deferred prompt and let the higher-priority reminder render.
+        if self._daily_prompt_active and self._completion_queue:
+            self._daily_prompt_deferred = True
+            self._daily_prompt_active = False
+            self._notice_until = 0.0
+            self._notice_title = ""
+            self._notice_body = ""
+            self.notice_card.hide()
         if (
             self._active_completion_turn_id is not None
             or not self._completion_queue
@@ -651,11 +930,34 @@ class PetWindow(QWidget):
             self.refresh()
 
     def _hide_notice_actions(self) -> None:
+        self.notice_continue_button.setText("继续微任务")
         self.notice_action_row.setEnabled(False)
         self.notice_continue_button.hide()
         self.notice_pause_button.hide()
         self.notice_complete_button.hide()
         self.notice_undo_button.hide()
+        self.daily_plan_start_button.hide()
+        self.daily_plan_skip_button.hide()
+
+    def _show_focus_guard_actions(self) -> None:
+        """Offer an explicit choice after the runaway-timer safeguard fires."""
+
+        self.notice_action_row.setEnabled(True)
+        self.notice_continue_button.setText("继续计时")
+        self.notice_continue_button.show()
+        self.notice_pause_button.hide()
+        self.notice_complete_button.show()
+
+    def _show_focus_guard_notice(self, focus: FocusSession, limit_minutes: int) -> None:
+        self._focus_guard_active = True
+        self.service.pause_focus(message="连续计时保护已暂停")
+        self.show_notice(
+            "计时保护已暂停",
+            f"“{focus.task.title}”已连续计时 {limit_minutes} 分钟。确认仍要继续，或直接完成这项任务。",
+            level="warning",
+            duration=24 * 60 * 60,
+        )
+        self._show_focus_guard_actions()
 
     def _show_history_undo(self) -> None:
         if self._deleted_history_record is None:
@@ -672,6 +974,11 @@ class PetWindow(QWidget):
         self.notice_complete_button.show()
 
     def _continue_after_ai(self) -> None:
+        if self._focus_guard_active:
+            self._focus_guard_active = False
+            self.apply_update(self.service.resume_focus(message="已确认继续计时"))
+            self.dismiss_notice()
+            return
         # The default is to keep the Waiting Task running.  Explicitly
         # dismissing the reminder makes the choice visible without changing
         # the focus clock.
@@ -684,11 +991,16 @@ class PetWindow(QWidget):
         self.dismiss_notice()
 
     def _complete_after_ai(self) -> None:
+        self._focus_guard_active = False
         self._active_completion_turn_id = None
         self.complete_focus()
 
     def dismiss_notice(self) -> None:
+        if self._daily_prompt_active:
+            self.service.set_setting("daily_planning_prompt_date", local_date_key())
+            self._daily_prompt_active = False
         self._active_completion_turn_id = None
+        self._focus_guard_active = False
         self.completion_banner_until = 0.0
         self._notice_until = 0.0
         self._notice_title = ""
@@ -698,6 +1010,13 @@ class PetWindow(QWidget):
         self._hide_notice_actions()
         self.notice_card.hide()
         self._show_next_completion_reminder()
+        if (
+            self._daily_prompt_deferred
+            and self._active_completion_turn_id is None
+            and not self._completion_queue
+        ):
+            self._daily_prompt_deferred = False
+            self.maybe_show_daily_planning_prompt()
         self.refresh()
 
     def set_hook_listener_error(self, error: str) -> None:
@@ -973,7 +1292,23 @@ class PetWindow(QWidget):
         self.state_label.setText(state)
         self.state_label.setToolTip(state)
         self._elide_state_title()
-        self.message_label.setVisible(not (completion_notice_visible and focus is None))
+        self.footer_state_label.setText(state)
+        self.footer_state_label.setToolTip(state)
+        self.footer_status_dot.setProperty(
+            "state",
+            "attention"
+            if needs_attention or terminal_blocked
+            else "active"
+            if has_running_ai or focus is not None
+            else "idle",
+        )
+        self.footer_status_dot.style().unpolish(self.footer_status_dot)
+        self.footer_status_dot.style().polish(self.footer_status_dot)
+        # A notice already carries the actionable explanation. Keeping the
+        # stale lifecycle sentence beside it creates two competing messages.
+        self.message_label.setVisible(
+            not (self._notice_is_visible() and not self.page_hidden)
+        )
         self.message_label.setText(self.last_message)
 
         self.ai_card.setVisible(False)
@@ -1010,12 +1345,28 @@ class PetWindow(QWidget):
             self._focus_full_title = focus.task.title
             self.focus_title.setText(self._focus_full_title)
             self.focus_title.setToolTip(focus.task.title)
+            if focus.task.tag and focus.task.tag != DEFAULT_TAG:
+                self.focus_tag.setText(focus.task.tag)
+                self.focus_tag.setVisible(True)
+            else:
+                self.focus_tag.clear()
+                self.focus_tag.setVisible(False)
             elapsed_text = format_duration(focus.elapsed_seconds())
             self.focus_time.setText(elapsed_text)
             self.compact_timer_label.setText(elapsed_text)
             self.compact_timer_label.setToolTip(f"{focus.task.title} · {elapsed_text}")
-            self.pause_button.setText("▶\n继续" if focus.is_paused else "Ⅱ\n暂停")
+            self.pause_button.setText("继续计时" if focus.is_paused else "暂停")
+            self.pause_button.setIcon(
+                self.style().standardIcon(
+                    QStyle.StandardPixmap.SP_MediaPlay
+                    if focus.is_paused
+                    else QStyle.StandardPixmap.SP_MediaPause
+                )
+            )
             self.switch_button.setEnabled(True)
+            self.switch_button.setVisible(True)
+            self.abandon_button.setVisible(True)
+            self.switch_action.setEnabled(True)
             self.switch_button.setToolTip(
                 "选择另一个 Waiting Task"
                 if focus.is_paused
@@ -1026,9 +1377,14 @@ class PetWindow(QWidget):
             self._focus_full_title = ""
             self.focus_title.clear()
             self.focus_title.setToolTip("")
+            self.focus_tag.clear()
+            self.focus_tag.setVisible(False)
             self.compact_timer_label.setText("00:00")
             self.compact_timer_label.setToolTip("当前 Waiting Task 计时")
             self.switch_button.setEnabled(False)
+            self.switch_button.setVisible(False)
+            self.switch_action.setEnabled(False)
+            self.abandon_button.setVisible(False)
 
         picker_visible = (
             self.task_picker_open
@@ -1037,7 +1393,7 @@ class PetWindow(QWidget):
         )
         if picker_visible:
             self.picker_title.setText(
-                "切换 Waiting Task" if focus is not None else "选一个等待任务"
+                "下一件做什么？" if focus is not None else "选一件事，开始专注"
             )
             self._refresh_suggestions()
         notice_visible = self._notice_is_visible() and not self.page_hidden
@@ -1054,14 +1410,10 @@ class PetWindow(QWidget):
         self.notice_card.setVisible(
             notice_visible and self.presentation_mode is not PresentationMode.ICON
         )
-        # Keep the AI lifecycle visible alongside an active micro-task.  The
-        # task timer is independent, so completion/attention feedback never
-        # replaces or stops the focus bubble.
-        self.ai_card.setVisible(
-            self.presentation_mode is not PresentationMode.ICON
-            and not self.page_hidden
-            and (has_running_ai or needs_attention or unknown_running or unknown_attention)
-        )
+        # The reference layout has one status line in the footer. Keeping a
+        # second lifecycle card above the picker/player makes the panel read
+        # like two stacked messages and was the source of the old overlap.
+        self.ai_card.setVisible(False)
         if focus is not None:
             self._elide_focus_title()
             QTimer.singleShot(0, self._elide_focus_title)
@@ -1086,7 +1438,7 @@ class PetWindow(QWidget):
 
         day_stats = self.service.stats_cache.get("day")
         minutes = int(day_stats.waiting_seconds // 60)
-        self.today_label.setText(f"\u4eca\u65e5\u56de\u6536 {minutes} \u5206\u949f")
+        self.today_label.setText(f"\u4eca\u65e5\u4e13\u6ce8 {minutes} \u5206\u949f")
         self.home_stats_label.setText(
             "\u4eca\u5929 \u00b7 Waiting Task "
             f"{format_duration(day_stats.waiting_seconds)}"
@@ -1100,6 +1452,7 @@ class PetWindow(QWidget):
         calendar_day_changed = calendar_day != self._last_calendar_day
         if calendar_day_changed:
             self._last_calendar_day = calendar_day
+            self._daily_prompt_active = False
         transient_expired = (
             bool(self._notice_body)
             and now >= self._notice_until
@@ -1108,6 +1461,18 @@ class PetWindow(QWidget):
             and now >= self._deleted_history_until
         )
         focus = self.service.focus
+        focus_guard_triggered = False
+        if focus is not None and not focus.is_paused:
+            guard_minutes = self._focus_guard_minutes
+            if (
+                guard_minutes > 0
+                and focus.id != self._focus_guard_notice_session_id
+                and focus.elapsed_seconds() >= guard_minutes * 60
+            ):
+                self._focus_guard_notice_session_id = focus.id
+                self._show_focus_guard_notice(focus, guard_minutes)
+                focus = self.service.focus
+                focus_guard_triggered = True
         if focus is not None:
             elapsed_text = format_duration(focus.elapsed_seconds())
             self.focus_time.setText(elapsed_text)
@@ -1120,12 +1485,14 @@ class PetWindow(QWidget):
             and now - self._desktop_unavailable_since >= DESKTOP_SOURCE_GRACE_SECONDS
             and not self._desktop_unknown_notice_shown
         )
-        if calendar_day_changed or transient_expired or desktop_unknown_due or (
+        if calendar_day_changed or transient_expired or focus_guard_triggered or desktop_unknown_due or (
             self._active_completion_turn_id is None
             and self._completion_queue
             and not self._notice_is_visible()
         ):
             self.refresh()
+        if calendar_day_changed:
+            QTimer.singleShot(0, self.maybe_show_daily_planning_prompt)
 
     def _schedule_fit_to_content(self) -> None:
         """Coalesce layout fitting requests from refresh and chip geometry."""
@@ -1146,9 +1513,19 @@ class PetWindow(QWidget):
         self.quick_task_tag.sync_height()
         self.card.layout().invalidate()
         self.card.layout().activate()
-        target_height = self.card.sizeHint().height() + 16
-        if self.height() != target_height:
-            self.setFixedHeight(target_height)
+        target_width = max(1, int(self._desired_window_width))
+        # Apply width first so wrapped labels and chip bars calculate their
+        # height against the target presentation width, not the previous one.
+        # The helper releases any stale size constraints before resizing.
+        target_width = max(target_width, self.minimumSizeHint().width())
+        self._apply_window_geometry(target_width, max(1, self.height()))
+        self.card.layout().invalidate()
+        self.card.layout().activate()
+        target_height = max(
+            self.card.sizeHint().height() + 16,
+            self.minimumSizeHint().height(),
+        )
+        self._apply_window_geometry(target_width, target_height)
 
     def _elide_focus_title(self) -> None:
         if not self._focus_full_title:
@@ -1187,50 +1564,74 @@ class PetWindow(QWidget):
         is_compact_player = mode is PresentationMode.COMPACT_PLAYER
         is_notice = mode is PresentationMode.NOTICE
         self.bubble_card.setVisible(mode is not PresentationMode.ICON)
-        self.header_details.setVisible(is_picker or is_notice)
+        # The old header_details remains a compatibility host; the visible
+        # header is the reference-style chrome row created in _build_ui.
+        self.header_details.setVisible(False)
+        # Compact mode is a timer-only surface.  The full chrome and status
+        # footer return when the Cookie is clicked to restore the player.
+        self.chrome_widget.setVisible(
+            mode not in {PresentationMode.ICON, PresentationMode.COMPACT_PLAYER}
+        )
         self.focus_card.setVisible(is_player)
         self.focus_controls.setVisible(is_player)
-        self.focus_hide_button.setVisible(is_player)
+        self.focus_hide_button.setVisible(False)
+        self.player_more_button.setVisible(False)
         self.compact_timer_label.setVisible(is_compact_player)
         self.picker.setVisible(is_picker)
         self.notice_card.setVisible(is_notice or is_picker or is_player)
         self.ai_card.setVisible(False)
-        self.footer_widget.setVisible(False)
+        self.footer_widget.setVisible(
+            mode not in {PresentationMode.ICON, PresentationMode.COMPACT_PLAYER}
+        )
 
         if mode is PresentationMode.ICON:
             width = self.pet.width() + 16
             margins = (4, 4, 4, 4)
             opacity = 0.88
         elif mode is PresentationMode.PLAYER:
-            # The player sits beside the pet inside the same header row.  Its
-            # window width therefore needs to reserve a full title row and
-            # four equal-width controls; the old 340px minimum squeezed
-            # long task names into the action buttons.
-            # Include the pet, bubble margins, and the focus card's minimum
-            # width in the top-level geometry; otherwise the rightmost
-            # cancel button can be clipped at the window edge.
-            width = max(570, self.pet.width() + 482)
-            margins = (7, 6, 7, 6)
+            # Keep the Cookie and player readable without turning a short
+            # focus session into a wide desktop panel.
+            # Four 44px action targets plus spacing need a little more than
+            # the previous 500px shell; keep the title and controls from
+            # competing for the same row on Windows' native style metrics.
+            width = max(540, self.pet.width() + 452)
+            margins = (6, 5, 6, 5)
             opacity = 0.96
         elif mode is PresentationMode.COMPACT_PLAYER:
-            # Keep only one small timer line in the existing bubble while the
-            # expanded page is hidden.  The full player returns on click.
+            # Keep a small timer-only bubble while the expanded page is
+            # hidden.  The Cookie remains beside it as the restore control.
             self.focus_card.setMinimumWidth(0)
-            width = max(220, self.pet.width() + 120)
-            margins = (6, 5, 6, 5)
+            self.bubble_card.setMinimumWidth(0)
+            self.bubble_card.setMaximumWidth(180)
+            self.bubble_card.setSizePolicy(
+                QSizePolicy.Policy.Fixed,
+                QSizePolicy.Policy.Fixed,
+            )
+            self.compact_timer_label.setSizePolicy(
+                QSizePolicy.Policy.Fixed,
+                QSizePolicy.Policy.Fixed,
+            )
+            width = max(170, self.pet.width() + 78)
+            margins = (0, 0, 0, 0)
             opacity = 0.96
         elif mode is PresentationMode.NOTICE:
             width = max(360, self.pet.width() + 290)
             margins = (7, 6, 7, 6)
             opacity = 0.96
         else:
-            width = max(430, self.pet.width() + 342)
+            width = max(520, self.pet.width() + 432)
             # The picker is the dense home surface.  Keep the outer card
-            # margins smaller than the player margins so the title, status,
-            # and task controls stay together without reducing click targets.
-            margins = (10, 8, 10, 8)
+            # margins aligned with the reference panel rather than squeezing
+            # chips and action buttons into one horizontal row.
+            margins = (6, 5, 6, 5)
             opacity = 1.0
 
+        if mode is not PresentationMode.COMPACT_PLAYER:
+            self.bubble_card.setMaximumWidth(16_777_215)
+            self.bubble_card.setSizePolicy(
+                QSizePolicy.Policy.Expanding,
+                QSizePolicy.Policy.Maximum,
+            )
         self.card.layout().setContentsMargins(*margins)
         self.card.setProperty("presentation", mode.value)
         self.card.style().unpolish(self.card)
@@ -1243,14 +1644,29 @@ class PetWindow(QWidget):
             if mode is PresentationMode.PICKER:
                 for button in self.suggestion_container.findChildren(QPushButton):
                     if button.objectName() in {"taskButton", "pausedTaskButton"}:
-                        button.setFixedHeight(32)
+                        button.setFixedHeight(
+                            30 if button.property("compact") is True else 32
+                        )
+                    elif (
+                        button.objectName() == "pickerStartButton"
+                        and button.property("compact") is True
+                    ):
+                        button.setFixedSize(46, 26)
             for button in self.header_details.findChildren(QPushButton):
                 if button.objectName() == "ghostButton":
                     button.setFixedHeight(28)
+        if mode is PresentationMode.PLAYER:
+            # Qt's stylesheet pass can restore platform button metrics; keep
+            # the four action targets compact and aligned after polishing.
+            self.pause_button.setFixedSize(84, 44)
+            self.switch_button.setFixedSize(72, 44)
+            self.complete_button.setFixedHeight(44)
+            self.abandon_button.setFixedSize(72, 44)
+            self.player_more_button.setFixedSize(90, 20)
         self.setWindowOpacity(opacity)
         if mode is PresentationMode.PLAYER:
             self.focus_card.setMinimumWidth(350)
-        self.setFixedWidth(width)
+        self._desired_window_width = width
         self._outer_shadow.setColor(
             QColor(40, 55, 50, 55 if mode is PresentationMode.ICON else 0)
         )
@@ -1258,7 +1674,54 @@ class PetWindow(QWidget):
         self.card.layout().invalidate()
         self.card.layout().activate()
         self._schedule_fit_to_content()
-        QTimer.singleShot(0, self._keep_on_screen)
+
+    def _screen_geometry_for_size(self, width: int, height: int):
+        """Return the available geometry for a prospective window size."""
+
+        center = QPoint(
+            self.x() + max(1, int(width)) // 2,
+            self.y() + max(1, int(height)) // 2,
+        )
+        screen = QApplication.screenAt(center) or QApplication.primaryScreen()
+        return screen.availableGeometry() if screen is not None else None
+
+    def _clamped_position(self, width: int, height: int) -> QPoint:
+        geometry = self._screen_geometry_for_size(width, height)
+        if geometry is None:
+            return self.pos()
+        margin = 10
+        left = geometry.left() + margin
+        top = geometry.top() + margin
+        right = max(left, geometry.left() + geometry.width() - width - margin)
+        bottom = max(top, geometry.top() + geometry.height() - height - margin)
+        return QPoint(
+            min(max(self.x(), left), right),
+            min(max(self.y(), top), bottom),
+        )
+
+    def _apply_window_geometry(self, width: int, height: int) -> None:
+        """Resize and reposition the translucent window as one operation.
+
+        ``setFixedWidth``/``setFixedHeight`` temporarily leave Qt with the
+        previous mode's maximum size while the new layout is calculating its
+        minimum size.  That produces the ``maximum size < minimum size``
+        warnings on Windows.  Keep the top-level unconstrained and clamp the
+        target rectangle before resizing instead.
+        """
+
+        self.setMinimumSize(QSize(0, 0))
+        self.setMaximumSize(QSize(16_777_215, 16_777_215))
+        width = max(1, int(width))
+        height = max(1, int(height))
+        minimum = self.minimumSizeHint()
+        width = max(width, minimum.width())
+        height = max(height, minimum.height())
+        position = self._clamped_position(width, height)
+        if self.pos() != position:
+            self.move(position)
+        target_size = QSize(width, height)
+        if self.size() != target_size:
+            self.resize(target_size)
 
     def _update_connection_status(self, force: bool = False) -> None:
         current = time.monotonic()
@@ -1374,8 +1837,9 @@ class PetWindow(QWidget):
                 meta_text = f"{summary.tag}  ·  完成 {summary.completed_count} 次 · 最近 {completed_at}"
                 meta = QLabel(meta_text)
                 meta.setObjectName("completedMeta")
+                meta_tone = self.service.tag_colors().get(summary.tag, tag_tone(summary.tag))
                 meta.setStyleSheet(
-                    f"color: {tag_tone_colors(tag_tone(summary.tag))[0]};"
+                    f"color: {tag_tone_colors(meta_tone)[0]};"
                 )
                 meta.setWordWrap(True)
                 task_text.addWidget(title)
@@ -1584,7 +2048,17 @@ class PetWindow(QWidget):
         )
 
     def _refresh_suggestions(self) -> None:
-        manual = self.service.list_manual_tasks()
+        # The picker is a "start today's work" surface.  The old implementation
+        # used the all-open-task query, so tasks planned for another date stayed
+        # visible after today's list was emptied in Task Manager.  Keep the
+        # picker and the daily planning page on the same date-scoped source.
+        manual = [
+            task.as_task()
+            for task in self.service.list_daily_tasks(
+                local_date_key(),
+                include_completed=False,
+            )
+        ]
         switching = self.service.focus is not None and self.service.focus.is_paused
         fixed_cycle = self._fixed_cycle_candidates_for_picker()
         paused = self.service.paused_focuses()
@@ -1603,9 +2077,17 @@ class PetWindow(QWidget):
         # Both queues are available on the home page.  The switcher uses the
         # same candidates, so an automatic pause never removes fixed tasks or
         # reinstates the old "finish before switching" restriction.
+        available_manual = available(manual)
+        available_fixed = available(fixed_cycle)
+        # The picker is a start surface, not the full task database. Keep a
+        # small stable recommendation in view and route the rest to the task
+        # manager so adding tasks cannot push the controls off-screen.
+        # The picker already labels the first group as "今日任务". Keep the
+        # per-row hierarchy quiet there and introduce one section label only
+        # when the fixed-cycle recommendations begin.
         groups = [
-            ("我的具体任务", available(manual)),
-            ("固定循环任务", available(fixed_cycle)),
+            ("", available_manual[:3]),
+            ("循环任务", available_fixed[:3]),
         ]
         source_mode = "switcher" if switching else "picker"
         tasks = [task for _title, group in groups for task in group]
@@ -1630,10 +2112,11 @@ class PetWindow(QWidget):
             if manual and has_fixed_cycle
             else "我的具体任务"
             if manual
-            else "固定循环任务"
+            else "循环任务"
             if has_fixed_cycle
-            else "固定任务未启用"
+            else "循环任务未启用"
         )
+        self.picker_source.setVisible(switching or not has_fixed_cycle)
         if (
             signature == self._suggestion_signature
             and paused_signature == self._paused_signature
@@ -1643,10 +2126,21 @@ class PetWindow(QWidget):
         self._suggestion_signature = signature
         self._suggestion_mode = source_mode
         self._paused_signature = paused_signature
+        self._clear_cycle_choices()
         while self.suggestion_layout.count():
             item = self.suggestion_layout.takeAt(0)
             widget = item.widget()
             if widget is not None:
+                if widget is self.cycle_header:
+                    widget.hide()
+                    widget.setParent(self.suggestion_container)
+                    continue
+                # Detach stale controls immediately.  ``deleteLater`` alone
+                # leaves the old button parented (and visible) until the next
+                # event-loop turn, which made deleted tasks appear to remain
+                # in the picker beside the freshly rebuilt list.
+                widget.hide()
+                widget.setParent(None)
                 widget.deleteLater()
         if paused:
             paused_title = QLabel("已暂停任务（点击继续）")
@@ -1665,11 +2159,11 @@ class PetWindow(QWidget):
                 )
                 self.suggestion_layout.addWidget(button)
         if not tasks and not paused:
-            empty = QLabel("暂无可用任务，请在 Waiting Task 中添加手动任务或启用固定任务。")
+            empty = QLabel("暂无可用任务，请在任务管理中添加任务或启用循环任务。")
             empty.setObjectName("muted")
             empty.setWordWrap(True)
             self.suggestion_layout.addWidget(empty)
-            configure = QPushButton("打开 Waiting Task")
+            configure = QPushButton("打开今日任务")
             configure.clicked.connect(self.open_task_manager)
             self.suggestion_layout.addWidget(configure)
             return
@@ -1677,25 +2171,122 @@ class PetWindow(QWidget):
         for section_title, section_tasks in groups:
             if not section_tasks:
                 continue
-            section = QLabel(section_title)
-            section.setObjectName("muted")
-            self.suggestion_layout.addWidget(section)
+            if section_title:
+                self.cycle_header_label.setText(section_title)
+                self._populate_cycle_choices(section_tasks, index)
+                self.cycle_header.show()
+                self.suggestion_layout.addWidget(self.cycle_header)
+                index += len(section_tasks)
+                continue
             for task in section_tasks:
-                button = QPushButton(f"{index} · {task.title}  ·  {task.tag}")
-                button.setObjectName("taskButton")
-                button.setFixedHeight(32)
-                button.setToolTip(task.title)
-                button.setCursor(Qt.CursorShape.PointingHandCursor)
-                button.clicked.connect(
-                    lambda _checked=False, selected=task: self.start_focus(selected)
-                )
-                self.suggestion_layout.addWidget(button)
+                self._add_picker_task_row(task, index, compact=False)
                 index += 1
+        hidden_count = max(0, len(available_manual) - 3)
+        if hidden_count:
+            more = QPushButton(f"还有 {hidden_count} 项任务 · 打开全部")
+            more.setObjectName("compactLinkButton")
+            more.setCursor(Qt.CursorShape.PointingHandCursor)
+            more.clicked.connect(self.open_task_manager)
+            self.suggestion_layout.addWidget(more)
+        # Rows can be rebuilt while the window is already in picker mode, so
+        # _set_presentation_mode is not necessarily called after they exist.
+        # Reapply compact metrics here as well to avoid the native Windows
+        # button style expanding the cycle actions back to its default size.
+        for button in self.suggestion_container.findChildren(QPushButton):
+            if button.objectName() == "taskButton":
+                button.setFixedHeight(30 if button.property("compact") is True else 32)
+            elif (
+                button.objectName() == "pickerStartButton"
+                and button.property("compact") is True
+            ):
+                button.setFixedSize(46, 26)
         self.suggestion_layout.invalidate()
         self.suggestion_container.updateGeometry()
         self.picker.layout().invalidate()
         self.picker.updateGeometry()
         self.card.layout().invalidate()
+
+    def _clear_cycle_choices(self) -> None:
+        """Remove the inline cycle links before rebuilding today's picker."""
+
+        while self.cycle_choices_layout.count():
+            item = self.cycle_choices_layout.takeAt(0)
+            widget = item.widget()
+            if widget is not None:
+                widget.hide()
+                widget.setParent(None)
+                widget.deleteLater()
+        self.cycle_choices_widget.setFixedWidth(0)
+
+    def _populate_cycle_choices(self, tasks: list[Task], start_index: int) -> None:
+        """Render fixed-cycle tasks as one compact line of direct-action text."""
+
+        for offset, task in enumerate(tasks):
+            label = f"{start_index + offset} · {task.title} · {task.tag or DEFAULT_TAG}"
+            button = QPushButton(label, self.cycle_choices_widget)
+            button.setObjectName("taskButton")
+            button.setProperty("compact", True)
+            button.setProperty("cycle", True)
+            button.setFixedHeight(30)
+            button.setToolTip(f"开始：{task.title}")
+            button.setCursor(Qt.CursorShape.PointingHandCursor)
+            button.clicked.connect(
+                lambda _checked=False, selected=task: self.start_focus(selected)
+            )
+            self.cycle_choices_layout.addWidget(button)
+        self.cycle_choices_layout.addStretch()
+        self.cycle_choices_widget.adjustSize()
+        width = max(1, self.cycle_choices_layout.sizeHint().width())
+        self.cycle_choices_widget.setFixedWidth(width)
+
+    def _add_picker_task_row(
+        self,
+        task: Task,
+        index: int,
+        *,
+        compact: bool = False,
+    ) -> None:
+        """Add a reference-style task row without stacking controls."""
+
+        row = QFrame(self.suggestion_container)
+        row.setObjectName("pickerTaskRow")
+        row.setProperty("compact", compact)
+        row.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        row_layout = QHBoxLayout(row)
+        row_layout.setContentsMargins(0, 1 if compact else 4, 0, 1 if compact else 4)
+        row_layout.setSpacing(8)
+
+        text_column = QVBoxLayout()
+        text_column.setContentsMargins(0, 0, 0, 0)
+        text_column.setSpacing(0)
+        title_button = QPushButton(f"{index} · {task.title}", row)
+        title_button.setObjectName("taskButton")
+        title_button.setProperty("compact", compact)
+        title_button.setFixedHeight(30 if compact else 32)
+        title_button.setToolTip(task.title)
+        title_button.setCursor(Qt.CursorShape.PointingHandCursor)
+        title_button.clicked.connect(
+            lambda _checked=False, selected=task: self.start_focus(selected)
+        )
+        text_column.addWidget(title_button)
+        tag_label = QLabel(task.tag or DEFAULT_TAG, row)
+        tag_label.setObjectName("pickerTaskTag")
+        tag_label.setProperty("compact", compact)
+        tag_label.setToolTip(f"标签：{task.tag or DEFAULT_TAG}")
+        text_column.addWidget(tag_label)
+        row_layout.addLayout(text_column, 1)
+
+        start_button = QPushButton("开始", row)
+        start_button.setObjectName("pickerStartButton")
+        start_button.setProperty("compact", compact)
+        start_button.setFixedSize(46 if compact else 52, 26 if compact else 30)
+        start_button.setCursor(Qt.CursorShape.PointingHandCursor)
+        start_button.setToolTip("开始这项任务的计时")
+        start_button.clicked.connect(
+            lambda _checked=False, selected=task: self.start_focus(selected)
+        )
+        row_layout.addWidget(start_button, 0, Qt.AlignmentFlag.AlignVCenter)
+        self.suggestion_layout.addWidget(row)
 
     def _fixed_cycle_candidates_for_picker(self) -> list[Task]:
         """Return one stable random sample for the currently open picker."""
@@ -1714,7 +2305,7 @@ class PetWindow(QWidget):
     def _start_random_task(self) -> None:
         tasks = self._fixed_cycle_candidates_for_picker()
         if not tasks:
-            self.last_message = "暂无启用的固定循环任务"
+            self.last_message = "暂无启用的循环任务"
             self.refresh()
             return
         self.start_focus(random.choice(tasks))
@@ -1731,22 +2322,37 @@ class PetWindow(QWidget):
                 for entry in entries
             ]
         self.service.set_default_task_entries(entries)
-        self.last_message = "固定循环任务已启用"
+        self.last_message = "循环任务已启用"
         self._invalidate_fixed_cycle_candidates()
         self.refresh()
 
-    def _add_quick_task(self) -> None:
+    def _add_quick_task(self, *, start: bool = True) -> None:
+        """Create a task from the picker.
+
+        ``start`` defaults to ``True`` for compatibility with integrations
+        that called this method directly before the picker exposed separate
+        actions.  Visible controls and Enter explicitly pass ``False``.
+        """
+
         try:
             task = self.service.add_manual_task(
                 self.quick_task_input.text(),
                 self.quick_task_tag.currentText(),
             )
-        except ValueError:
+        except ValueError as error:
+            self.quick_task_error.setText(str(error) or "请输入任务名称")
+            self.quick_task_error.show()
             self.quick_task_input.setFocus()
             return
         self.quick_task_input.clear()
+        self.quick_task_error.clear()
+        self.quick_task_error.hide()
         self._suggestion_signature = None
-        self.start_focus(task)
+        self.last_message = "任务已添加到今天"
+        if start:
+            self.start_focus(task)
+        else:
+            self.refresh()
 
     def start_focus(self, task: Task) -> None:
         if self.service.has_active_focus():
@@ -1786,6 +2392,7 @@ class PetWindow(QWidget):
         self.apply_update(self.service.toggle_focus_pause())
 
     def complete_focus(self) -> None:
+        self._focus_guard_active = False
         completed_title = self.service.focus.task.title if self.service.focus is not None else "微任务"
         self._active_completion_turn_id = None
         self._invalidate_fixed_cycle_candidates()
@@ -1805,6 +2412,7 @@ class PetWindow(QWidget):
             self.task_dialog.refresh()
 
     def abandon_focus(self) -> None:
+        self._focus_guard_active = False
         self._invalidate_fixed_cycle_candidates()
         self.apply_update(self.service.abandon_focus())
 
@@ -1846,7 +2454,13 @@ class PetWindow(QWidget):
                 return
         elif self.task_picker_open and Qt.Key.Key_1 <= event.key() <= Qt.Key.Key_3:
             tasks = [
-                *self.service.list_manual_tasks(),
+                *(
+                    task.as_task()
+                    for task in self.service.list_daily_tasks(
+                        local_date_key(),
+                        include_completed=False,
+                    )
+                ),
                 *self._fixed_cycle_candidates_for_picker(),
             ]
             index = event.key() - Qt.Key.Key_1
@@ -1877,7 +2491,7 @@ class PetWindow(QWidget):
         else:
             picker_action = menu.addAction("选择微任务")
             picker_action.triggered.connect(self.toggle_picker)
-        tasks_action = menu.addAction("Waiting Task")
+        tasks_action = menu.addAction("今日任务")
         tasks_action.triggered.connect(self.open_task_manager)
         stats_action = menu.addAction("统计")
         stats_action.triggered.connect(self.open_statistics)
@@ -1968,6 +2582,7 @@ class PetWindow(QWidget):
 
         tags = self.service.available_tags()
         selected = self.quick_task_tag.currentText()
+        self.quick_task_tag.set_tone_map(self.service.tag_colors())
         self.quick_task_tag.set_tags(tags, selected)
 
     def _settings_changed(self) -> None:
@@ -1985,6 +2600,7 @@ class PetWindow(QWidget):
 
     def _apply_window_preferences(self) -> None:
         preferences = self.service.load_preferences()
+        self._focus_guard_minutes = preferences.focus_guard_minutes
         old_cookie_size = self.pet.width()
         self.pet.set_size(preferences.cookie_size)
         if self.pet.width() != old_cookie_size:
@@ -2164,13 +2780,9 @@ class PetWindow(QWidget):
             self.move(geometry.right() - self.width() - 10, self.y())
 
     def _keep_on_screen(self) -> None:
-        screen = QApplication.screenAt(self.frameGeometry().center()) or QApplication.primaryScreen()
-        if screen is None:
-            return
-        geometry = screen.availableGeometry()
-        x = min(max(self.x(), geometry.left() + 10), max(geometry.left() + 10, geometry.right() - self.width() - 10))
-        y = min(max(self.y(), geometry.top() + 10), max(geometry.top() + 10, geometry.bottom() - self.height() - 10))
-        self.move(x, y)
+        position = self._clamped_position(self.width(), self.height())
+        if self.pos() != position:
+            self.move(position)
 
     def enterEvent(self, event) -> None:  # noqa: N802
         if self.presentation_mode is PresentationMode.ICON:

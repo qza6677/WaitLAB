@@ -1,12 +1,19 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from enum import StrEnum
 
 
 def utc_now() -> datetime:
     return datetime.now(timezone.utc)
+
+
+def local_date_key(value: datetime | None = None) -> str:
+    """Return a local-calendar date key for daily planning."""
+
+    current = value or datetime.now(timezone.utc)
+    return current.astimezone().date().isoformat()
 
 
 def to_iso(value: datetime | None) -> str | None:
@@ -35,6 +42,13 @@ class FocusOutcome(StrEnum):
     ABANDONED = "abandoned"
 
 
+class RepeatRule(StrEnum):
+    ROTATION = "rotation"
+    DAILY = "daily"
+    WEEKDAYS = "weekdays"
+    WEEKLY = "weekly"
+
+
 @dataclass(frozen=True, slots=True)
 class Task:
     id: int | None
@@ -42,6 +56,63 @@ class Task:
     kind: TaskKind
     sort_order: int = 0
     tag: str = DEFAULT_TAG
+    priority: int = 0
+    due_date: str | None = None
+    planned_date: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class DailyTask:
+    """A manual task with explicit daily-planning state.
+
+    ``Task`` remains the compact focus-task value object.  This separate model
+    keeps planning metadata out of fixed-cycle and historical focus paths.
+    """
+
+    id: int
+    title: str
+    tag: str
+    planned_date: str
+    initial_planned_date: str
+    status: str = "open"
+    sort_order: int = 0
+    completed_at: datetime | None = None
+    carried_from_date: str | None = None
+    rollover_count: int = 0
+    priority: int = 0
+    due_date: str | None = None
+
+    @property
+    def is_completed(self) -> bool:
+        return self.status == "completed"
+
+    def as_task(self) -> Task:
+        return Task(
+            self.id,
+            self.title,
+            TaskKind.MANUAL,
+            self.sort_order,
+            self.tag,
+            self.priority,
+            self.due_date,
+            self.planned_date,
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class TaskPlanningEvent:
+    """One date change in a manual task's planning history."""
+
+    id: int
+    task_id: int
+    from_date: str
+    to_date: str
+    event_type: str
+    created_at: datetime
+
+    @property
+    def label(self) -> str:
+        return "顺延" if self.event_type == "carry" else "重新安排"
 
 
 @dataclass(frozen=True, slots=True)
@@ -49,6 +120,37 @@ class DefaultTaskEntry:
     title: str
     enabled: bool = True
     tag: str = DEFAULT_TAG
+    repeat_rule: str = RepeatRule.ROTATION.value
+    repeat_weekday: int | None = None
+
+    @property
+    def schedule_label(self) -> str:
+        if self.repeat_rule == RepeatRule.DAILY.value:
+            return "每天"
+        if self.repeat_rule == RepeatRule.WEEKDAYS.value:
+            return "工作日"
+        if self.repeat_rule == RepeatRule.WEEKLY.value:
+            weekday = self.repeat_weekday if self.repeat_weekday is not None else 0
+            return f"每周{('一', '二', '三', '四', '五', '六', '日')[weekday]}"
+        return "轮播"
+
+    @property
+    def next_execution_date(self) -> str | None:
+        """Return the next local date on which this scheduled task is due."""
+
+        if self.repeat_rule == RepeatRule.ROTATION.value:
+            return None
+        today = datetime.now().astimezone().date()
+        target_weekday = self.repeat_weekday if self.repeat_weekday in range(7) else 0
+        for offset in range(366):
+            target = today + timedelta(days=offset)
+            if self.repeat_rule == RepeatRule.DAILY.value:
+                return target.isoformat()
+            if self.repeat_rule == RepeatRule.WEEKDAYS.value and target.weekday() < 5:
+                return target.isoformat()
+            if self.repeat_rule == RepeatRule.WEEKLY.value and target.weekday() == target_weekday:
+                return target.isoformat()
+        return None
 
 
 @dataclass(slots=True)

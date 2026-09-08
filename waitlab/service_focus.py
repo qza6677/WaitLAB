@@ -74,7 +74,7 @@ class FocusCoordinator:
         so a one-second clock update cannot reshuffle the visible choices.
         """
     
-        entries = [entry for entry in self.storage.default_task_entries() if entry.enabled]
+        entries = self.storage.due_default_task_entries()
         if randomize and len(entries) > limit:
             entries = random.sample(entries, limit)
         else:

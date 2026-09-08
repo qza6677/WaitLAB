@@ -244,7 +244,13 @@ def main() -> int:
     app.aboutToQuit.connect(clean_up)
     window.show()
     if service.has_recovered_focus:
-        QTimer.singleShot(0, window.show_recovery_prompt)
+        def show_startup_prompts() -> None:
+            window.show_recovery_prompt()
+            window.maybe_show_daily_planning_prompt()
+
+        QTimer.singleShot(0, show_startup_prompts)
+    else:
+        QTimer.singleShot(0, window.maybe_show_daily_planning_prompt)
     return app.exec()
 
 

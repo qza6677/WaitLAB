@@ -5,17 +5,19 @@ from datetime import datetime, timedelta, timezone
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 import pytest
-from PySide6.QtCore import QObject, QPoint, QRect, QThread, QTimer, Qt, Signal, Slot
+from PySide6.QtCore import QDate, QObject, QPoint, QRect, QThread, QTimer, Qt, Signal, Slot
 from PySide6.QtTest import QTest
-from PySide6.QtWidgets import QApplication, QDialog, QMessageBox, QPushButton
+from PySide6.QtWidgets import QApplication, QDialog, QMessageBox, QPushButton, QToolButton
 
 from waitlab.models import (
     DefaultTaskEntry,
     FocusOutcome,
+    RepeatRule,
     ServiceUpdate,
     TagTimeBucket,
     Task,
     TaskKind,
+    local_date_key,
 )
 from waitlab.app import DesktopActivityReceiver
 from waitlab.service import WaitLabService
@@ -30,6 +32,8 @@ from waitlab.ui import (
     TagManagerDialog,
     TaskManagerDialog,
 )
+from waitlab.ui_dialogs import TagColorDialog, TaskEditDialog, TaskPlanningHistoryDialog
+from waitlab.ui_widgets import ColorWheelWidget, TagPickerButton
 
 
 @pytest.fixture(scope="session")
@@ -118,22 +122,35 @@ def test_player_keeps_long_title_and_controls_separated(pet_window, qt_app):
 
     assert pet_window.presentation_mode.value == "player"
     assert pet_window.bubble_card.width() >= pet_window.focus_card.width()
-    buttons = pet_window.focus_card.findChildren(QPushButton)
-    buttons = [button for button in buttons if button.objectName() in {
+    buttons = [
+        *pet_window.focus_card.findChildren(QPushButton),
+        *pet_window.focus_card.findChildren(QToolButton),
+    ]
+    action_buttons = [button for button in buttons if button.objectName() in {
         "playerButton",
         "playerPrimaryButton",
+        "playerSwitchButton",
         "playerCloseButton",
     }]
-    assert len(buttons) == 3
-    assert all(button.width() >= 94 and button.height() >= 44 for button in buttons)
+    assert len(action_buttons) == 4
+    widths = {button.objectName(): button.width() for button in action_buttons}
+    assert widths["playerButton"] >= 64
+    assert widths["playerPrimaryButton"] >= 96
+    assert widths["playerSwitchButton"] >= 64
+    assert widths["playerCloseButton"] >= 64
+    assert all(button.height() >= 44 for button in action_buttons)
+    more_button = pet_window.focus_card.findChild(QToolButton, "playerMoreButton")
+    assert more_button is not None and more_button.height() <= 24
 
     rectangles = [
         QRect(button.mapToGlobal(QPoint(0, 0)), button.size())
-        for button in buttons
+        for button in action_buttons
     ]
-    assert not rectangles[0].intersects(rectangles[1])
-    assert not rectangles[1].intersects(rectangles[2])
-    assert not rectangles[0].intersects(rectangles[2])
+    for index, rectangle in enumerate(rectangles):
+        assert all(
+            not rectangle.intersects(other)
+            for other in rectangles[index + 1 :]
+        )
 
 
 def test_minimized_player_keeps_timer_and_cookie_restores_controls(pet_window, qt_app):
@@ -148,9 +165,13 @@ def test_minimized_player_keeps_timer_and_cookie_restores_controls(pet_window, q
     assert pet_window.presentation_mode.value == "compact_player"
     assert pet_window.focus_card.isVisible() is False
     assert pet_window.focus_controls.isVisible() is False
+    assert pet_window.chrome_widget.isVisible() is False
+    assert pet_window.footer_widget.isVisible() is False
     assert pet_window.compact_timer_label.isVisible()
     assert pet_window.compact_timer_label.text() == pet_window.focus_time.text()
     assert task.title in pet_window.compact_timer_label.toolTip()
+    assert pet_window.width() <= 240
+    assert pet_window.height() <= 120
 
     pet_window.pet.clicked.emit()
     _flush(qt_app)
@@ -170,7 +191,8 @@ def test_paused_player_can_open_switcher_and_start_another_task(pet_window, qt_a
     pause_button = pet_window.focus_card.findChild(QPushButton, "playerButton")
     switch_button = pet_window.focus_card.findChild(QPushButton, "playerSwitchButton")
     assert pause_button is not None and switch_button is not None
-    assert switch_button.isEnabled() is True
+    assert switch_button.isVisible() is True
+    assert pet_window.switch_action.isEnabled() is True
 
     switch_button.click()
     _flush(qt_app)
@@ -201,6 +223,8 @@ def test_switcher_includes_fixed_cycle_tasks_with_manual_tasks(pet_window, qt_ap
 
     switch_button = pet_window.focus_card.findChild(QPushButton, "playerSwitchButton")
     assert switch_button is not None
+    assert switch_button.isVisible() is True
+    assert pet_window.switch_action.isEnabled() is True
     switch_button.click()
     _flush(qt_app)
 
@@ -242,6 +266,33 @@ def test_home_picker_shows_manual_and_stable_fixed_sample(pet_window, qt_app):
     assert [task.title for task in pet_window._fixed_cycle_candidates or []] == first_sample
 
 
+def test_home_picker_uses_today_tasks_after_task_manager_deletion(pet_window, qt_app):
+    today = pet_window.service.storage.add_manual_task("今天要做的任务")
+    tomorrow = QDate.currentDate().addDays(1).toString("yyyy-MM-dd")
+    pet_window.service.storage.add_manual_task("明天再做的任务", planned_date=tomorrow)
+    pet_window.task_picker_open = True
+    pet_window.refresh()
+    _flush(qt_app)
+
+    buttons = [
+        button
+        for button in pet_window.suggestion_container.findChildren(QPushButton)
+        if button.objectName() == "taskButton"
+    ]
+    assert any(today.title in button.text() for button in buttons)
+    assert not any("明天再做的任务" in button.text() for button in buttons)
+
+    pet_window.service.delete_manual_task(today.id)
+    pet_window._tasks_changed()
+    _flush(qt_app)
+    buttons = [
+        button
+        for button in pet_window.suggestion_container.findChildren(QPushButton)
+        if button.objectName() == "taskButton"
+    ]
+    assert not any(today.title in button.text() for button in buttons)
+
+
 def test_fixed_task_button_can_start_without_manual_tasks(pet_window, qt_app):
     pet_window.task_picker_open = True
     pet_window.refresh()
@@ -271,7 +322,7 @@ def test_home_picker_can_reenable_disabled_fixed_tasks_without_overwriting_title
     pet_window.refresh()
     _flush(qt_app)
 
-    assert pet_window.picker_source.text() == "固定任务未启用"
+    assert pet_window.picker_source.text() == "循环任务未启用"
     assert pet_window.enable_fixed_tasks_button.isVisible()
     assert not any(
         button.objectName() == "taskButton"
@@ -297,6 +348,7 @@ def test_statistics_dialog_shows_donut_and_daily_stacked_chart(qt_app, tmp_path)
     now = datetime.now().astimezone().replace(microsecond=0)
     session = storage.start_focus(task, when=now - timedelta(minutes=20))
     storage.end_focus(session, FocusOutcome.COMPLETED, when=now - timedelta(minutes=5))
+    service.set_tag_color("阅读", "#7A42D8")
     dialog = StatisticsDialog(service)
     try:
         assert isinstance(dialog.today_donut, TagDonutChart)
@@ -308,6 +360,9 @@ def test_statistics_dialog_shows_donut_and_daily_stacked_chart(qt_app, tmp_path)
         assert len(dialog.series_chart._buckets) == 7
         assert dialog.week_button.isChecked()
         assert "阅读" in dialog.today_legend.text()
+        assert dialog.today_donut._color_map["阅读"] == "#7A42D8"
+        assert dialog.series_chart._color_map["阅读"] == "#7A42D8"
+        assert "#7A42D8" in dialog.today_legend.text()
 
         dialog.month_button.click()
         _flush(qt_app)
@@ -316,6 +371,24 @@ def test_statistics_dialog_shows_donut_and_daily_stacked_chart(qt_app, tmp_path)
     finally:
         dialog.close()
         storage.close()
+
+
+def test_tag_color_picker_supports_wheel_and_hex_values(qt_app):
+    wheel = ColorWheelWidget("#7A42D8")
+    wheel.resize(224, 224)
+    wheel.show()
+    picker = TagColorDialog("#7A42D8")
+    picker.show()
+    try:
+        _flush(qt_app)
+        assert wheel.color().name() == "#7a42d8"
+        picker.hex_edit.setText("#2E9F75")
+        picker._hex_edited("#2E9F75")
+        assert picker.selected_color() == "#2E9F75"
+        assert picker.wheel.size().width() >= 192
+    finally:
+        picker.close()
+        wheel.close()
 
 
 def test_daily_stacked_chart_hits_segments_and_locks_details(qt_app):
@@ -386,6 +459,26 @@ def test_minimized_picker_restores_by_clicking_cookie(pet_window, qt_app):
     assert pet_window.presentation_mode.value == "picker"
 
 
+def test_pet_window_mode_changes_keep_valid_size_constraints(pet_window, qt_app):
+    """Presentation switches must not leave a stale fixed max size behind."""
+
+    task = pet_window.service.storage.add_manual_task("几何约束测试")
+    transitions = [
+        lambda: (setattr(pet_window, "task_picker_open", True), pet_window.refresh()),
+        lambda: pet_window.start_focus(task),
+        lambda: pet_window.hide_page(),
+        lambda: pet_window.show_page(),
+        lambda: pet_window.hide_page(),
+    ]
+    for transition in transitions:
+        transition()
+        _flush(qt_app)
+        assert pet_window.minimumWidth() <= pet_window.maximumWidth()
+        assert pet_window.minimumHeight() <= pet_window.maximumHeight()
+        assert pet_window.maximumWidth() >= 16_000_000
+        assert pet_window.maximumHeight() >= 16_000_000
+
+
 def test_home_quick_add_can_assign_a_tag(pet_window, qt_app):
     pet_window.task_picker_open = True
     pet_window.refresh()
@@ -409,9 +502,8 @@ def test_home_and_task_pool_use_colored_tag_chips(qt_app, tmp_path):
     dialog = TaskManagerDialog(service)
     try:
         assert isinstance(window.quick_task_tag, TagChipBar)
-        assert isinstance(dialog.manual_tag, TagChipBar)
+        assert isinstance(dialog.manual_tag, TagPickerButton)
         assert isinstance(dialog.task_tag_filter, TagChipBar)
-        assert isinstance(dialog.fixed_tag, TagChipBar)
         window.quick_task_tag.setCurrentText("编码")
         assert window.quick_task_tag.currentText() == "编码"
         dialog.task_tag_filter.setCurrentText("阅读")
@@ -431,7 +523,328 @@ def test_home_and_task_pool_use_colored_tag_chips(qt_app, tmp_path):
         storage.close()
 
 
-def test_home_tag_picker_is_single_line_and_scrollable(qt_app, tmp_path):
+def test_task_edit_dialog_can_read_and_write_planning_date(qt_app):
+    dialog = TaskEditDialog("整理任务", "未分类", ["未分类"], planned_date="2026-08-31")
+    try:
+        assert dialog.date_edit is not None
+        assert dialog.date_edit.date().toString("yyyy-MM-dd") == "2026-08-31"
+        dialog.date_edit.setDate(QDate(2026, 9, 2))
+        assert dialog.daily_values() == ("整理任务", "未分类", "2026-09-02", 0, None)
+    finally:
+        dialog.close()
+
+
+def test_task_edit_dialog_can_configure_fixed_repeat_schedule(qt_app):
+    dialog = TaskEditDialog(
+        "每周复盘",
+        "未分类",
+        ["未分类"],
+        repeat_rule=RepeatRule.WEEKLY.value,
+        repeat_weekday=4,
+    )
+    try:
+        assert dialog.repeat_rule_combo is not None
+        assert dialog.repeat_weekday_combo is not None
+        assert dialog.repeat_rule_combo.currentData() == RepeatRule.WEEKLY.value
+        assert dialog.repeat_weekday_combo.currentData() == 4
+        assert dialog.repeat_weekday_combo.isEnabled()
+        assert dialog.schedule_values() == (
+            "每周复盘",
+            "未分类",
+            RepeatRule.WEEKLY.value,
+            4,
+        )
+
+        dialog.repeat_rule_combo.setCurrentIndex(
+            dialog.repeat_rule_combo.findData(RepeatRule.WEEKDAYS.value)
+        )
+        assert dialog.repeat_weekday_combo.isEnabled() is False
+        assert dialog.schedule_values()[2:] == (RepeatRule.WEEKDAYS.value, None)
+    finally:
+        dialog.close()
+
+
+def test_focus_guard_pauses_long_session_and_allows_explicit_resume(qt_app, tmp_path):
+    storage = Storage(tmp_path / "waitlab.db")
+    service = WaitLabService(storage)
+    storage.set_setting("focus_guard_minutes", "1")
+    task = storage.add_manual_task("长时间计时保护")
+    service.start_focus(task, when=datetime.now(timezone.utc) - timedelta(minutes=2))
+    window = PetWindow(service)
+    try:
+        window._tick()
+        assert service.focus is not None
+        assert service.focus.is_paused is True
+        assert window._focus_guard_active is True
+        assert window.notice_continue_button.text() == "继续计时"
+
+        window.notice_continue_button.click()
+        _flush(qt_app)
+        assert service.focus is not None
+        assert service.focus.is_paused is False
+        assert window._focus_guard_active is False
+    finally:
+        window.timer.stop()
+        window.close()
+        storage.close()
+
+
+def test_task_manager_can_browse_previous_and_today_dates(qt_app, tmp_path):
+    storage = Storage(tmp_path / "waitlab.db")
+    service = WaitLabService(storage)
+    yesterday = QDate.currentDate().addDays(-1)
+    yesterday_key = yesterday.toString("yyyy-MM-dd")
+    storage.add_manual_task("昨天的计划", planned_date=yesterday_key)
+    storage.add_manual_task("今天的计划", planned_date=local_date_key())
+    dialog = TaskManagerDialog(service)
+    try:
+        assert dialog._planning_date == local_date_key()
+        today_row = dialog.list_widget.itemWidget(dialog.list_widget.item(0))
+        assert today_row is not None
+        assert today_row.title_label.text() == "今天的计划"
+        assert dialog.overdue_list.count() == 1
+        overdue_rows = [
+            dialog.overdue_list.item(index)
+            for index in range(dialog.overdue_list.count())
+            if dialog.overdue_list.itemWidget(dialog.overdue_list.item(index)) is not None
+        ]
+        assert overdue_rows
+        assert all(item.text() == "" for item in overdue_rows)
+
+        dialog.planning_date_edit.setDate(yesterday)
+        _flush(qt_app)
+        assert dialog._planning_date == yesterday_key
+        assert dialog.list_widget.count() == 1
+        assert dialog.list_widget.item(0).text() == ""
+        row = dialog.list_widget.itemWidget(dialog.list_widget.item(0))
+        assert row is not None
+        assert row.title_label.text() == "昨天的计划"
+        assert dialog.carry_overdue_button.text() == f"延续选中到{yesterday_key}"
+
+        dialog._show_today()
+        _flush(qt_app)
+        assert dialog._planning_date == local_date_key()
+    finally:
+        dialog.close()
+        storage.close()
+
+
+def test_task_manager_uses_inline_fixed_rows_without_priority_controls(qt_app, tmp_path):
+    storage = Storage(tmp_path / "waitlab.db")
+    service = WaitLabService(storage)
+    storage.set_default_task_entries([DefaultTaskEntry("固定复盘", True, "未分类")])
+    dialog = TaskManagerDialog(service)
+    try:
+        assert not hasattr(dialog, "manual_priority")
+        assert dialog.fixed_list.count() == 1
+        item = dialog.fixed_list.item(0)
+        row = dialog.fixed_list.itemWidget(item)
+        assert row is not None
+        assert row.title_label.text() == "固定复盘"
+        assert row.edit_button.isHidden() is True
+        assert row.delete_button.isHidden() is True
+        assert row.more_button.isHidden() is False
+        assert [action.text() for action in row.more_menu.actions() if not action.isSeparator()] == [
+            "编辑",
+            "删除",
+        ]
+        row.enabled_checkbox.click()
+        _flush(qt_app)
+        assert storage.default_task_entries()[0].enabled is False
+    finally:
+        dialog.close()
+        storage.close()
+
+
+def test_task_manager_uses_focused_sections_and_compact_task_actions(qt_app, tmp_path):
+    storage = Storage(tmp_path / "waitlab.db")
+    service = WaitLabService(storage)
+    storage.add_manual_task("一项较长的今日任务内容", "论文写作")
+    dialog = TaskManagerDialog(service)
+    try:
+        dialog.show()
+        _flush(qt_app)
+        assert dialog.section_tabs.count() == 3
+        assert [dialog.section_tabs.tabText(i) for i in range(3)] == [
+            "我的任务",
+            "固定循环",
+            "标签管理",
+        ]
+        assert dialog.page_title.text() == "任务管理"
+        assert dialog.width() <= 440
+        assert not any(
+            button.text() == "管理标签"
+            for button in dialog.findChildren(QPushButton)
+        )
+        item = dialog.list_widget.item(0)
+        row = dialog.list_widget.itemWidget(item)
+        assert row is not None
+        assert row.start_button.isVisible()
+        assert row.more_button.isVisible()
+        assert row.height() == 40
+        assert row.tag_label.height() == row.start_button.height() == row.more_button.height()
+        assert row.edit_button.isHidden()
+        assert row.delete_button.isHidden()
+        dialog.section_tabs.setCurrentIndex(1)
+        _flush(qt_app)
+        assert dialog.date_nav_widget.isHidden()
+        fixed_item = dialog.fixed_list.item(0)
+        fixed_row = dialog.fixed_list.itemWidget(fixed_item) if fixed_item else None
+        assert fixed_row is not None
+        assert fixed_row.height() == 40
+        assert fixed_row.tag_label.height() == fixed_row.more_button.height()
+        dialog.section_tabs.setCurrentIndex(2)
+        _flush(qt_app)
+        assert dialog.tag_manager_page.tag_list.count() >= 1
+        dialog.section_tabs.setCurrentIndex(0)
+        _flush(qt_app)
+        assert dialog.date_nav_widget.isVisible()
+    finally:
+        dialog.close()
+        storage.close()
+
+
+def test_task_manager_changes_daily_and_fixed_tags_inline(qt_app, tmp_path):
+    storage = Storage(tmp_path / "waitlab.db")
+    service = WaitLabService(storage)
+    service.add_tag("论文写作")
+    service.add_tag("会议准备")
+    daily = storage.add_manual_task("整理实验记录", "未分类")
+    storage.set_default_task_entries([DefaultTaskEntry("固定复盘", True, "未分类")])
+    dialog = TaskManagerDialog(service)
+    try:
+        dialog.show()
+        _flush(qt_app)
+
+        daily_row = dialog.list_widget.itemWidget(dialog.list_widget.item(0))
+        assert isinstance(daily_row.tag_label, TagPickerButton)
+        daily_action = next(
+            action
+            for action in daily_row.tag_label.menu().actions()
+            if action.text() == "论文写作"
+        )
+        daily_action.trigger()
+        _flush(qt_app)
+        updated_daily = next(
+            task for task in storage.list_daily_tasks() if task.id == daily.id
+        )
+        assert updated_daily.tag == "论文写作"
+
+        dialog.section_tabs.setCurrentIndex(1)
+        _flush(qt_app)
+        fixed_item = dialog.fixed_list.item(0)
+        fixed_row = dialog.fixed_list.itemWidget(fixed_item)
+        assert isinstance(fixed_row.tag_label, TagPickerButton)
+        fixed_action = next(
+            action
+            for action in fixed_row.tag_label.menu().actions()
+            if action.text() == "会议准备"
+        )
+        fixed_action.trigger()
+        _flush(qt_app)
+        assert storage.default_task_entries()[0].tag == "会议准备"
+    finally:
+        dialog.close()
+        storage.close()
+
+
+def test_task_tag_popup_stays_inside_dialog_and_updates_task(qt_app, tmp_path):
+    storage = Storage(tmp_path / "waitlab.db")
+    service = WaitLabService(storage)
+    service.add_tag("PopupTag")
+    daily = storage.add_manual_task("Popup test task", "未分类")
+    dialog = TaskManagerDialog(service)
+    try:
+        dialog.show()
+        _flush(qt_app)
+        row = dialog.list_widget.itemWidget(dialog.list_widget.item(0))
+        assert row is not None
+
+        QTest.mouseClick(row.tag_label, Qt.MouseButton.LeftButton)
+        _flush(qt_app)
+        popup = dialog.tag_popup
+        assert popup.isVisible()
+        assert popup.parentWidget() is dialog
+        popup_rect = popup.geometry()
+        dialog_rect = dialog.rect()
+        assert dialog_rect.contains(popup_rect.topLeft())
+        assert dialog_rect.contains(popup_rect.bottomRight())
+
+        item = next(
+            popup.list_widget.item(index)
+            for index in range(popup.list_widget.count())
+            if popup.list_widget.item(index).data(Qt.ItemDataRole.UserRole) == "PopupTag"
+        )
+        QTest.mouseClick(
+            popup.list_widget.viewport(),
+            Qt.MouseButton.LeftButton,
+            pos=popup.list_widget.visualItemRect(item).center(),
+        )
+        _flush(qt_app)
+        updated = next(
+            task for task in storage.list_daily_tasks() if task.id == daily.id
+        )
+        assert updated.tag == "PopupTag"
+        assert not popup.isVisible()
+    finally:
+        dialog.close()
+        storage.close()
+
+
+def test_task_manager_default_width_never_clips_task_actions(qt_app, tmp_path):
+    storage = Storage(tmp_path / "waitlab.db")
+    service = WaitLabService(storage)
+    storage.add_manual_task("一项很长但仍需完整保留操作入口的今日任务", "Vibe coding")
+    dialog = TaskManagerDialog(service)
+    try:
+        dialog.show()
+        _flush(qt_app)
+        assert dialog.width() == 420
+        assert dialog.height() == 600
+        assert dialog.content_scroll.horizontalScrollBar().maximum() == 0
+        assert dialog.input.height() == 46
+        assert dialog.manual_due_date.isHidden()
+
+        row = dialog.list_widget.itemWidget(dialog.list_widget.item(0))
+        assert row.more_button.geometry().right() <= row.rect().right()
+        assert row.start_button.geometry().right() <= row.rect().right()
+        assert row.tag_label.geometry().right() <= row.rect().right()
+        assert row.title_label.width() > 0
+
+        dialog.manual_due_enabled.setChecked(True)
+        _flush(qt_app)
+        assert dialog.manual_due_date.isVisible()
+        assert dialog.content_scroll.horizontalScrollBar().maximum() == 0
+
+        for page in (1, 2):
+            dialog.section_tabs.setCurrentIndex(page)
+            _flush(qt_app)
+            assert dialog.content_scroll.horizontalScrollBar().maximum() == 0
+    finally:
+        dialog.close()
+        storage.close()
+
+
+def test_task_planning_history_dialog_lists_date_changes(qt_app, tmp_path):
+    storage = Storage(tmp_path / "waitlab.db")
+    service = WaitLabService(storage)
+    task = storage.add_manual_task("保留顺延轨迹", planned_date="2026-08-31")
+    storage.carry_manual_task(task.id, "2026-09-01")
+    current = storage.get_daily_task(task.id)
+    assert current is not None
+    dialog = TaskPlanningHistoryDialog(
+        current,
+        service.list_task_planning_events(task.id),
+    )
+    try:
+        assert dialog.event_list.count() == 1
+        assert "2026-08-31 → 2026-09-01" in dialog.event_list.item(0).text()
+    finally:
+        dialog.close()
+        storage.close()
+
+
+def test_home_task_composer_is_not_rendered_in_picker(qt_app, tmp_path):
     storage = Storage(tmp_path / "waitlab.db")
     service = WaitLabService(storage)
     window = PetWindow(service)
@@ -440,19 +853,10 @@ def test_home_tag_picker_is_single_line_and_scrollable(qt_app, tmp_path):
         window.refresh()
         _flush(qt_app)
 
-        bar = window.quick_task_tag
-        scroll = window.quick_task_tag_scroll
-        assert bar._layout.wraps() is False
-        assert scroll.verticalScrollBarPolicy() == Qt.ScrollBarPolicy.ScrollBarAlwaysOff
-        assert scroll.horizontalScrollBarPolicy() == Qt.ScrollBarPolicy.ScrollBarAsNeeded
-        assert len({button.geometry().y() for button in bar.findChildren(QPushButton, "tagChip")}) == 1
-        assert scroll.horizontalScrollBar().maximum() > 0
-
-        bar.set_tags(["很长的标签一", "很长的标签二", "很长的标签三", "很长的标签四"])
-        _flush(qt_app)
-        assert bar.width() == bar.sizeHint().width()
-        assert scroll.horizontalScrollBar().maximum() > 0
-        assert len({button.geometry().y() for button in bar.findChildren(QPushButton, "tagChip")}) == 1
+        # Task creation, including tag selection, is intentionally owned by
+        # TaskManagerDialog; the picker remains a selection/start surface.
+        assert window.quick_compose.isHidden()
+        assert not window.quick_task_tag_scroll.isVisible()
     finally:
         window.timer.stop()
         window.close()
@@ -694,7 +1098,9 @@ def test_task_pool_search_and_undo_delete(qt_app, tmp_path):
         dialog.task_search.setText("图表")
         qt_app.processEvents()
         assert dialog.list_widget.count() == 1
-        assert "整理图表" in dialog.list_widget.item(0).text()
+        row = dialog.list_widget.itemWidget(dialog.list_widget.item(0))
+        assert row is not None
+        assert row.title_label.text() == "整理图表"
         dialog.task_search.clear()
         dialog.list_widget.setCurrentRow(0)
         dialog._delete_selected()
@@ -762,6 +1168,8 @@ def test_completed_history_can_be_cleared_from_settings(qt_app, tmp_path, monkey
         window.open_settings()
         dialog = window.settings_dialog
         assert dialog is not None
+        dialog.settings_tabs.setCurrentIndex(2)
+        _flush(qt_app)
         assert dialog.clear_history_button.isVisible()
 
         dialog.clear_history_button.click()

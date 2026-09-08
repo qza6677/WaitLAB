@@ -35,6 +35,7 @@ class TagDonutChart(QWidget):
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self._values: dict[str, float] = {}
+        self._color_map: dict[str, str] = {}
         self._total = 0.0
         self._hovered_tag: str | None = None
         self.setMinimumSize(220, 220)
@@ -58,6 +59,10 @@ class TagDonutChart(QWidget):
         self._total = sum(self._values.values())
         self._hovered_tag = None
         self.setToolTip("")
+        self.update()
+
+    def set_color_map(self, color_map: dict[str, str] | None) -> None:
+        self._color_map = dict(color_map or {})
         self.update()
 
     def _chart_rect(self) -> QRectF:
@@ -106,7 +111,7 @@ class TagDonutChart(QWidget):
         painter.setPen(Qt.PenStyle.NoPen)
         for tag, seconds in self._values.items():
             span = -360 * seconds / self._total
-            color = chart_color(tag)
+            color = chart_color(tag, color_map=self._color_map)
             if tag == self._hovered_tag:
                 color = color.lighter(118)
             painter.setBrush(color)
@@ -165,6 +170,7 @@ class DailyTagStackedChart(QWidget):
         super().__init__(parent)
         self._period = "week"
         self._buckets: list[TagTimeBucket] = []
+        self._color_map: dict[str, str] = {}
         self._segments: list[StackedChartSegment] = []
         self._hovered_index = -1
         self._locked_index = -1
@@ -186,6 +192,10 @@ class DailyTagStackedChart(QWidget):
         self._locked_index = -1
         self._cursor_position = None
         self.setToolTip("")
+        self.update()
+
+    def set_color_map(self, color_map: dict[str, str] | None) -> None:
+        self._color_map = dict(color_map or {})
         self.update()
 
     def _plot_rect(self) -> QRectF:
@@ -364,7 +374,7 @@ class DailyTagStackedChart(QWidget):
                 )
                 segment_index = len(self._segments) - 1
                 painter.setPen(Qt.PenStyle.NoPen)
-                color = chart_color(tag)
+                color = chart_color(tag, color_map=self._color_map)
                 is_active = segment_index == self._locked_index or (
                     self._locked_index < 0 and segment_index == self._hovered_index
                 )
@@ -442,5 +452,4 @@ class DailyTagStackedChart(QWidget):
             self.setToolTip(self._tooltip_for(self._locked_index))
         self.update()
         super().leaveEvent(event)  # type: ignore[arg-type]
-
 

@@ -38,6 +38,9 @@ class Preferences:
     quiet_start: str = "22:00"
     quiet_end: str = "08:00"
     cookie_size: int = 88
+    # A defensive ceiling for one continuous focus session.  Zero keeps the
+    # guard disabled for users who intentionally run long sessions.
+    focus_guard_minutes: int = 240
 
     @classmethod
     def load(cls, storage: Storage) -> "Preferences":
@@ -65,6 +68,13 @@ class Preferences:
             quiet_start=storage.get_setting("quiet_start", "22:00"),
             quiet_end=storage.get_setting("quiet_end", "08:00"),
             cookie_size=_read_int(storage, "cookie_size", 88, 48, 160),
+            focus_guard_minutes=_read_int(
+                storage,
+                "focus_guard_minutes",
+                240,
+                0,
+                720,
+            ),
         )
 
     def save(self, storage: Storage) -> None:
@@ -90,6 +100,10 @@ class Preferences:
         storage.set_setting("quiet_start", self.quiet_start)
         storage.set_setting("quiet_end", self.quiet_end)
         storage.set_setting("cookie_size", str(max(48, min(160, self.cookie_size))))
+        storage.set_setting(
+            "focus_guard_minutes",
+            str(max(0, min(720, self.focus_guard_minutes))),
+        )
 
     def is_quiet_now(self, now: time | None = None) -> bool:
         if not self.quiet_hours_enabled:
