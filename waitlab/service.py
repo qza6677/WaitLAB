@@ -112,6 +112,12 @@ class WaitLabService:
     def set_default_task_entries(self, entries: list[DefaultTaskEntry]) -> None:
         self.storage.set_default_task_entries(entries)
 
+    def merge_default_task_entries(
+        self,
+        defaults: list[DefaultTaskEntry],
+    ) -> list[DefaultTaskEntry]:
+        return self.storage.merge_default_task_entries(defaults)
+
     def list_manual_tasks(self) -> list[Task]:
         return self.storage.list_manual_tasks()
 
@@ -137,6 +143,23 @@ class WaitLabService:
     ) -> Task:
         return self.storage.add_manual_task(
             title,
+            tag,
+            planned_date,
+            priority=priority,
+            due_date=due_date,
+        )
+
+    def add_manual_tasks(
+        self,
+        titles: list[str],
+        tag: str = DEFAULT_TAG,
+        planned_date: str | datetime | None = None,
+        *,
+        priority: int = 0,
+        due_date: str | datetime | None = None,
+    ) -> list[Task]:
+        return self.storage.add_manual_tasks(
+            titles,
             tag,
             planned_date,
             priority=priority,
@@ -315,6 +338,10 @@ class WaitLabService:
         return self.focus_coordinator.paused_focuses()
 
 
+    def suspended_focuses(self) -> list[FocusSession]:
+        return self.focus_coordinator.suspended_focuses()
+
+
     def open_focuses(self) -> list[FocusSession]:
         return self.focus_coordinator.open_focuses()
 
@@ -411,6 +438,10 @@ class WaitLabService:
         return self.focus_coordinator.start_focus(task, when)
 
 
+    def switch_focus(self, task: Task, when: datetime | None = None) -> ServiceUpdate:
+        return self.focus_coordinator.switch_focus(task, when)
+
+
     def toggle_focus_pause(self, when: datetime | None = None) -> ServiceUpdate:
         return self.focus_coordinator.toggle_focus_pause(when)
 
@@ -421,6 +452,14 @@ class WaitLabService:
         message: str = "微任务已暂停",
     ) -> ServiceUpdate:
         return self.focus_coordinator.pause_focus(when, message)
+
+
+    def suspend_focus(
+        self,
+        when: datetime | None = None,
+        message: str = "任务已暂存，仍在任务队列中",
+    ) -> ServiceUpdate:
+        return self.focus_coordinator.suspend_focus(when, message)
 
 
     def resume_focus(

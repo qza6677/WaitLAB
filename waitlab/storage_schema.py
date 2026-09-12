@@ -35,6 +35,7 @@ SCHEMA_SQL = """
                 ended_at TEXT,
                 paused_seconds REAL NOT NULL DEFAULT 0,
                 paused_at TEXT,
+                suspended_at TEXT,
                 last_heartbeat_at TEXT,
                 outcome TEXT,
                 task_tag TEXT NOT NULL DEFAULT '\u672a\u5206\u7c7b',

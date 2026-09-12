@@ -56,7 +56,7 @@ from .models import (
 )
 from .preferences import PopupMode, Preferences
 from .service import WaitLabService
-from .storage_defaults import DEFAULT_TASKS
+from .storage_defaults import DEFAULT_TASK_TAGS, DEFAULT_TASKS
 from .task_filters import filter_and_sort_tasks
 from .ui_charts import DailyTagStackedChart, TagDonutChart
 from .ui_primitives import (
@@ -664,6 +664,7 @@ class TaskManagerDialog(QDialog):
         super().__init__(parent)
         self.service = service
         self._deleted_task: Task | None = None
+        self._default_reset_backup: list[DefaultTaskEntry] | None = None
         self._planning_date = local_date_key()
         self.setWindowTitle("WaitLAB \u00b7 任务管理")
         # The default size is the supported working size.  Users should not
@@ -849,7 +850,7 @@ class TaskManagerDialog(QDialog):
         filter_row.addWidget(self.task_sort)
         self.filter_panel = QWidget()
         self.filter_panel.setLayout(filter_row)
-        self.filter_panel.setVisible(False)
+        self.filter_panel.setVisible(True)
         layout.addWidget(self.filter_panel)
         tag_filter_row = QHBoxLayout()
         tag_filter_label = QLabel("\u7b5b\u9009\u6807\u7b7e")
@@ -858,7 +859,7 @@ class TaskManagerDialog(QDialog):
         tag_filter_row.addWidget(self.task_tag_filter, 1)
         self.tag_filter_panel = QWidget()
         self.tag_filter_panel.setLayout(tag_filter_row)
-        self.tag_filter_panel.setVisible(False)
+        self.tag_filter_panel.setVisible(True)
         layout.addWidget(self.tag_filter_panel)
         self.list_widget = QListWidget()
         self._configure_task_list(self.list_widget)
@@ -901,8 +902,12 @@ class TaskManagerDialog(QDialog):
         fixed_add.clicked.connect(self._add_fixed_task)
         fixed_reset = QPushButton("\u6062\u590d\u9ed8\u8ba4")
         fixed_reset.clicked.connect(self._reset_defaults)
+        self.undo_default_reset_button = QPushButton("\u64a4\u9500\u6062\u590d")
+        self.undo_default_reset_button.setVisible(False)
+        self.undo_default_reset_button.clicked.connect(self._undo_default_reset)
         fixed_controls.addWidget(fixed_add)
         fixed_controls.addStretch()
+        fixed_controls.addWidget(self.undo_default_reset_button)
         fixed_controls.addWidget(fixed_reset)
         layout.addLayout(fixed_controls)
         self.fallback_title = QLabel("无今日任务时的循环预览")
@@ -985,15 +990,24 @@ class TaskManagerDialog(QDialog):
         # A dialog parented to the desktop pet can inherit a position close to
         # the screen edge.  Clamp it after the first layout pass so the user
         # never sees a page whose left or right controls are cut off.
-        screen = None
+        screen = QApplication.screenAt(self.frameGeometry().center())
         parent = self.parentWidget()
-        if parent is not None:
+        if screen is None and parent is not None:
             screen = QApplication.screenAt(parent.frameGeometry().center())
-        screen = screen or QApplication.screenAt(self.frameGeometry().center())
         screen = screen or QApplication.primaryScreen()
         if screen is None:
             return
         available = screen.availableGeometry()
+        width_budget = max(1, available.width() - 20)
+        height_budget = max(1, available.height() - 20)
+        self.setMinimumSize(
+            min(420, width_budget),
+            min(560, height_budget),
+        )
+        self.resize(
+            min(max(self.width(), self.minimumWidth()), width_budget),
+            min(max(self.height(), self.minimumHeight()), height_budget),
+        )
         frame = self.frameGeometry()
         inside = (
             frame.left() >= available.left()
@@ -1219,11 +1233,11 @@ class TaskManagerDialog(QDialog):
         daily_tasks = self.service.list_daily_tasks(selected_date)
         completed_count = sum(task.is_completed for task in daily_tasks)
         self.today_hint.setText(f"{completed_count} / {len(daily_tasks)} 已完成")
-        # These controls are hidden in the new daily view but remain wired for
-        # compatibility with older integrations and saved UI tests.
+        # Search, sort, and tag filtering stay visible so completed tasks can
+        # be found without needing a separate mode switch.
         if query or selected_tag != "\u5168\u90e8\u6807\u7b7e":
             tasks = filter_and_sort_tasks(
-                [task.as_task() for task in daily_tasks if not task.is_completed],
+                [task.as_task() for task in daily_tasks],
                 query=query,
                 tag=selected_tag,
                 sort_mode=self.task_sort.currentText(),
@@ -1465,17 +1479,16 @@ class TaskManagerDialog(QDialog):
             self.input.setFocus()
             return
         try:
-            for title in titles:
-                self.service.add_manual_task(
-                    title,
-                    self.manual_tag.currentText(),
-                    planned_date=self._planning_date,
-                    due_date=(
-                        self.manual_due_date.date().toString(Qt.DateFormat.ISODate)
-                        if self.manual_due_enabled.isChecked()
-                        else None
-                    ),
-                )
+            self.service.add_manual_tasks(
+                titles,
+                self.manual_tag.currentText(),
+                planned_date=self._planning_date,
+                due_date=(
+                    self.manual_due_date.date().toString(Qt.DateFormat.ISODate)
+                    if self.manual_due_enabled.isChecked()
+                    else None
+                ),
+            )
         except ValueError as error:
             self._show_action_notice(str(error) or "任务名称不能为空")
             self.input.setFocus()
@@ -1670,6 +1683,7 @@ class TaskManagerDialog(QDialog):
             self._delete_fixed_item(item)
 
     def _persist_fixed(self) -> None:
+        self._clear_default_reset_undo()
         entries: list[DefaultTaskEntry] = []
         seen: set[str] = set()
         for index in range(self.fixed_list.count()):
@@ -1805,20 +1819,56 @@ class TaskManagerDialog(QDialog):
 
     def _reset_defaults(self) -> None:
         current = self.service.default_task_entries()
-        has_customization = [entry.title for entry in current] != list(DEFAULT_TASKS)
-        if has_customization:
-            answer = QMessageBox.question(
-                self,
-                "恢复默认循环任务？",
-                "这会替换当前循环任务的名称、标签、启用状态和循环规则。继续吗？",
-                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-                QMessageBox.StandardButton.No,
-            )
-            if answer != QMessageBox.StandardButton.Yes:
-                return
-        self._fill_fixed_tasks([DefaultTaskEntry(title, True, DEFAULT_TAG) for title in DEFAULT_TASKS])
-        self._persist_fixed()
-        self._show_action_notice("已恢复默认循环任务")
+        defaults = [
+            DefaultTaskEntry(title, True, DEFAULT_TASK_TAGS.get(title, DEFAULT_TAG))
+            for title in DEFAULT_TASKS
+        ]
+        if current == defaults:
+            self._show_action_notice("当前已经是默认循环任务")
+            return
+        current_titles = {entry.title for entry in current}
+        missing = [entry for entry in defaults if entry.title not in current_titles]
+        dialog = QMessageBox(self)
+        dialog.setWindowTitle("恢复默认循环任务")
+        dialog.setText(
+            f"当前有 {len(current)} 项，默认配置有 {len(defaults)} 项；请选择恢复方式"
+        )
+        dialog.setInformativeText(
+            "补充缺失项会保留已有名称、标签、启用状态和循环规则；替换全部会覆盖当前配置。"
+        )
+        supplement = dialog.addButton("补充缺失项", QMessageBox.ButtonRole.AcceptRole)
+        replace = dialog.addButton("替换全部", QMessageBox.ButtonRole.DestructiveRole)
+        dialog.addButton("取消", QMessageBox.ButtonRole.RejectRole)
+        supplement.setEnabled(bool(missing))
+        dialog.exec()
+        clicked = dialog.clickedButton()
+        if clicked is supplement:
+            self.service.merge_default_task_entries(defaults)
+            self.refresh()
+            self.tasks_changed.emit()
+            self._show_action_notice(f"已补充 {len(missing)} 项默认循环任务")
+            return
+        if clicked is replace:
+            self.service.set_default_task_entries(defaults)
+            self._default_reset_backup = current
+            self.undo_default_reset_button.setVisible(True)
+            self.refresh()
+            self.tasks_changed.emit()
+            self._show_action_notice("已替换为默认循环任务，可立即撤销")
+
+    def _clear_default_reset_undo(self) -> None:
+        self._default_reset_backup = None
+        self.undo_default_reset_button.setVisible(False)
+
+    def _undo_default_reset(self) -> None:
+        if self._default_reset_backup is None:
+            return
+        backup = self._default_reset_backup
+        self._clear_default_reset_undo()
+        self.service.set_default_task_entries(backup)
+        self.refresh()
+        self.tasks_changed.emit()
+        self._show_action_notice("已撤销恢复默认")
 
     def _has_fixed_title(self, title: str, except_item: QListWidgetItem | None = None) -> bool:
         return any(

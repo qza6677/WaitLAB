@@ -161,10 +161,17 @@ class FocusSession:
     paused_seconds: float = 0.0
     paused_at: datetime | None = None
     last_heartbeat_at: datetime | None = None
+    suspended_at: datetime | None = None
 
     @property
     def is_paused(self) -> bool:
         return self.paused_at is not None
+
+    @property
+    def is_suspended(self) -> bool:
+        """Whether this unfinished session has been returned to the queue."""
+
+        return self.suspended_at is not None
 
     def elapsed_seconds(self, now: datetime | None = None) -> float:
         endpoint = self.paused_at or now or utc_now()

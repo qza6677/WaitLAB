@@ -216,49 +216,75 @@ class TaskRepository:
         priority: int = 0,
         due_date: str | datetime | None = None,
     ) -> Task:
-        clean_title = " ".join(title.strip().split())
-        if not clean_title:
+        return self.add_manual_tasks(
+            [title],
+            tag,
+            planned_date,
+            priority=priority,
+            due_date=due_date,
+        )[0]
+
+    def add_manual_tasks(
+        self,
+        titles: list[str],
+        tag: str = DEFAULT_TAG,
+        planned_date: str | datetime | None = None,
+        *,
+        priority: int = 0,
+        due_date: str | datetime | None = None,
+    ) -> list[Task]:
+        clean_titles = [" ".join(str(title).strip().split()) for title in titles]
+        if not clean_titles or any(not title for title in clean_titles):
             raise ValueError("任务名称不能为空")
         day = self._normalize_planned_date(planned_date)
         clean_priority = self._normalize_priority(priority)
         clean_due_date = self._normalize_due_date(due_date)
-        next_order = self._connection.execute(
-            "SELECT COALESCE(MAX(sort_order), -1) + 1 FROM tasks WHERE status = 'open' AND planned_date = ?",
-            (day,),
-        ).fetchone()[0]
         clean_tag = self._normalize_tag(tag)
-        if clean_tag not in self.available_tags():
+        available_tags = self.available_tags()
+        if clean_tag not in available_tags:
             # A task imported from an older profile may carry a tag that is no
             # longer part of the built-in list. Keep it selectable and visible
             # in the tag manager instead of silently hiding it.
-            self._save_available_tags_uncommitted(self.available_tags() + [clean_tag])
-        cursor = self._connection.execute(
-            "INSERT INTO tasks(title, status, sort_order, created_at, tag, planned_date, initial_planned_date, priority, due_date) VALUES (?, 'open', ?, ?, ?, ?, ?, ?, ?)",
-            (
-                clean_title,
-                next_order,
-                to_iso(utc_now()),
-                clean_tag,
-                day,
-                day,
-                clean_priority,
-                clean_due_date,
-            ),
-        )
-        self._connection.commit()
-        task_id = cursor.lastrowid
-        if task_id is None:
-            raise RuntimeError("无法创建任务")
-        return Task(
-            int(task_id),
-            clean_title,
-            TaskKind.MANUAL,
-            next_order,
-            clean_tag,
-            clean_priority,
-            clean_due_date,
-            day,
-        )
+            available_tags.append(clean_tag)
+        with self._connection:
+            if clean_tag not in self.available_tags():
+                self._save_available_tags_uncommitted(available_tags)
+            next_order = self._connection.execute(
+                "SELECT COALESCE(MAX(sort_order), -1) + 1 FROM tasks WHERE status = 'open' AND planned_date = ?",
+                (day,),
+            ).fetchone()[0]
+            created: list[Task] = []
+            for clean_title in clean_titles:
+                cursor = self._connection.execute(
+                    "INSERT INTO tasks(title, status, sort_order, created_at, tag, planned_date, initial_planned_date, priority, due_date) VALUES (?, 'open', ?, ?, ?, ?, ?, ?, ?)",
+                    (
+                        clean_title,
+                        next_order,
+                        to_iso(utc_now()),
+                        clean_tag,
+                        day,
+                        day,
+                        clean_priority,
+                        clean_due_date,
+                    ),
+                )
+                task_id = cursor.lastrowid
+                if task_id is None:
+                    raise RuntimeError("无法创建任务")
+                created.append(
+                    Task(
+                        int(task_id),
+                        clean_title,
+                        TaskKind.MANUAL,
+                        next_order,
+                        clean_tag,
+                        clean_priority,
+                        clean_due_date,
+                        day,
+                    )
+                )
+                next_order += 1
+        return created
 
     def list_manual_tasks(self) -> list[Task]:
         rows = self._connection.execute(
@@ -768,6 +794,18 @@ class TaskRepository:
             if entries:
                 return entries
         return [DefaultTaskEntry(title, True, DEFAULT_TASK_TAGS.get(title, DEFAULT_TAG)) for title in self._default_task_order()]
+
+    def merge_default_task_entries(
+        self,
+        defaults: list[DefaultTaskEntry],
+    ) -> list[DefaultTaskEntry]:
+        """Append missing built-in entries while preserving user settings."""
+
+        current = self.default_task_entries()
+        known = {entry.title for entry in current}
+        merged = current + [entry for entry in defaults if entry.title not in known]
+        self.set_default_task_entries(merged)
+        return merged
 
     def due_default_task_entries(
         self,

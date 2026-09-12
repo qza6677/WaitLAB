@@ -1,12 +1,13 @@
 from __future__ import annotations
 
-from datetime import timedelta
+from datetime import datetime, timedelta, timezone
 
 import os
 import pytest
+from PySide6.QtCore import Qt
 from PySide6.QtWidgets import QApplication, QPushButton
 
-from waitlab.models import local_date_key
+from waitlab.models import FocusOutcome, local_date_key
 from waitlab.service import WaitLabService
 from waitlab.storage import Storage
 from waitlab.ui import PetWindow
@@ -132,6 +133,35 @@ def test_picker_caps_recommendations_and_keeps_many_tasks_on_screen(qt_app, tmp_
         ]
         assert len(task_buttons) <= 6
         assert window.height() <= QApplication.primaryScreen().availableGeometry().height()
+    finally:
+        window.timer.stop()
+        window.close()
+        storage.close()
+
+
+def test_picker_bounds_completed_history_and_keeps_it_scrollable(qt_app, tmp_path):
+    storage = Storage(tmp_path / "waitlab.db")
+    service = WaitLabService(storage)
+    now = datetime.now(timezone.utc).replace(microsecond=0)
+    for index in range(12):
+        task = storage.add_manual_task(f"已完成计时任务 {index + 1}")
+        session = storage.start_focus(
+            task,
+            when=now - timedelta(minutes=index + 1),
+        )
+        storage.finish_focus_and_task(session, FocusOutcome.COMPLETED, when=now)
+    window = PetWindow(service)
+    try:
+        window.task_picker_open = True
+        window.refresh()
+        _flush(qt_app)
+
+        assert window.today_completed_list.count() == 12
+        assert (
+            window.today_completed_list.verticalScrollBarPolicy()
+            == Qt.ScrollBarPolicy.ScrollBarAsNeeded
+        )
+        assert window.today_completed_list.maximumHeight() <= window._completed_list_height_budget()
     finally:
         window.timer.stop()
         window.close()

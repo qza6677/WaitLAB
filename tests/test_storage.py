@@ -98,6 +98,28 @@ def test_custom_fixed_tasks_are_preserved_during_default_content_migration(tmp_p
         migrated.close()
 
 
+def test_merging_builtin_defaults_preserves_existing_customization(tmp_path):
+    storage = Storage(tmp_path / "waitlab.db")
+    try:
+        existing = DefaultTaskEntry(
+            DEFAULT_TASKS[0],
+            False,
+            "自定义标签",
+            RepeatRule.WEEKLY.value,
+            4,
+        )
+        storage.set_default_task_entries([existing])
+        defaults = [DefaultTaskEntry(title, True) for title in DEFAULT_TASKS]
+
+        merged = storage.merge_default_task_entries(defaults)
+
+        assert merged[0] == existing
+        assert [entry.title for entry in merged] == [*DEFAULT_TASKS]
+        assert storage.default_task_entries()[0] == existing
+    finally:
+        storage.close()
+
+
 def test_fixed_task_repeat_rules_are_persisted_and_filtered_by_date(tmp_path):
     path = tmp_path / "waitlab.db"
     storage = Storage(path)

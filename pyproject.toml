@@ -1,6 +1,6 @@
 [project]
 name = "waitlab"
-version = "0.5.18"
+version = "0.5.19"
 description = "A local Windows task manager with focus timing and Codex activity integration."
 requires-python = ">=3.11"
 dependencies = [

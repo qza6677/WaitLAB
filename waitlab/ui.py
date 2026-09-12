@@ -91,6 +91,8 @@ from .windowing import apply_native_topmost
 
 
 DESKTOP_SOURCE_GRACE_SECONDS = 12.0
+PLAYER_ACTION_WIDTH = 84
+PLAYER_ACTION_HEIGHT = 44
 
 
 class PetWindow(QWidget):
@@ -107,6 +109,7 @@ class PetWindow(QWidget):
         self.task_dialog: TaskManagerDialog | None = None
         self.settings_dialog: SettingsDialog | None = None
         self.task_picker_open = False
+        self._task_switcher_open = False
         self.page_hidden = False
         self.pet_hidden = False
         self._native_topmost_enabled = True
@@ -114,7 +117,7 @@ class PetWindow(QWidget):
         self._suggestion_signature: tuple[tuple[int | None, str, str, str], ...] | None = None
         self._suggestion_mode: str | None = None
         self._fixed_cycle_candidates: list[Task] | None = None
-        self._paused_signature: tuple[tuple[int, str, str, int], ...] | None = None
+        self._paused_signature: tuple[tuple[int, str, str, int, bool], ...] | None = None
         self._completed_signature: tuple[tuple[int | None, str, float, int, str], ...] | None = None
         self.completion_banner_until = 0.0
         self._completion_queue: list[ServiceUpdate] = []
@@ -332,18 +335,27 @@ class PetWindow(QWidget):
         controls = QHBoxLayout()
         controls.setContentsMargins(0, 0, 0, 0)
         controls.setSpacing(4)
-        self.pause_button = QPushButton("暂停")
+        self.pause_button = QPushButton("暂停计时")
         self.pause_button.setObjectName("playerButton")
         self.pause_button.setIcon(self.style().standardIcon(QStyle.StandardPixmap.SP_MediaPause))
-        self.pause_button.setToolTip("暂停或继续任务")
+        self.pause_button.setToolTip("暂停计时或继续当前任务")
         self.pause_button.clicked.connect(self.toggle_pause)
         self.pause_button.setIconSize(QSize(16, 16))
+
+        self.suspend_button = QPushButton("暂存")
+        self.suspend_button.setObjectName("playerSuspendButton")
+        self.suspend_button.setIcon(
+            self.style().standardIcon(QStyle.StandardPixmap.SP_DialogSaveButton)
+        )
+        self.suspend_button.setIconSize(QSize(16, 16))
+        self.suspend_button.setToolTip("保存当前进度并放回任务队列")
+        self.suspend_button.clicked.connect(self.suspend_focus)
 
         self.switch_button = QPushButton("切换", self.focus_card)
         self.switch_button.setObjectName("playerSwitchButton")
         self.switch_button.setIcon(self.style().standardIcon(QStyle.StandardPixmap.SP_BrowserReload))
         self.switch_button.setIconSize(QSize(16, 16))
-        self.switch_button.setToolTip("暂停当前任务后切换到另一个任务")
+        self.switch_button.setToolTip("浏览其他任务；选中后才暂停当前任务")
         self.switch_button.clicked.connect(self.open_task_switcher)
         self.switch_button.setVisible(False)
         self.complete_button = QPushButton("完成")
@@ -384,15 +396,18 @@ class PetWindow(QWidget):
         self.hide_action.triggered.connect(self.hide_page)
 
         self.pause_button.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
-        self.pause_button.setFixedSize(84, 44)
+        self.pause_button.setFixedSize(PLAYER_ACTION_WIDTH, PLAYER_ACTION_HEIGHT)
+        self.suspend_button.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
+        self.suspend_button.setFixedSize(PLAYER_ACTION_WIDTH, PLAYER_ACTION_HEIGHT)
         self.switch_button.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
-        self.switch_button.setFixedSize(72, 44)
-        self.complete_button.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
-        self.complete_button.setMinimumSize(96, 44)
+        self.switch_button.setFixedSize(PLAYER_ACTION_WIDTH, PLAYER_ACTION_HEIGHT)
+        self.complete_button.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
+        self.complete_button.setFixedSize(PLAYER_ACTION_WIDTH, PLAYER_ACTION_HEIGHT)
         self.abandon_button.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
-        self.abandon_button.setFixedSize(72, 44)
+        self.abandon_button.setFixedSize(PLAYER_ACTION_WIDTH, PLAYER_ACTION_HEIGHT)
         controls.addWidget(self.pause_button, 0)
-        controls.addWidget(self.complete_button, 1)
+        controls.addWidget(self.complete_button, 0)
+        controls.addWidget(self.suspend_button, 0)
         controls.addWidget(self.switch_button, 0)
         controls.addWidget(self.abandon_button, 0)
         self.focus_controls = QWidget(self.focus_card)
@@ -593,6 +608,9 @@ class PetWindow(QWidget):
         self.today_completed_list.setHorizontalScrollBarPolicy(
             Qt.ScrollBarPolicy.ScrollBarAlwaysOff
         )
+        self.today_completed_list.setVerticalScrollBarPolicy(
+            Qt.ScrollBarPolicy.ScrollBarAsNeeded
+        )
         self.today_completed_list.setVerticalScrollMode(
             QAbstractItemView.ScrollMode.ScrollPerPixel
         )
@@ -721,9 +739,12 @@ class PetWindow(QWidget):
         self.notice_continue_button = QPushButton("继续微任务")
         self.notice_continue_button.setObjectName("noticeActionButton")
         self.notice_continue_button.clicked.connect(self._continue_after_ai)
-        self.notice_pause_button = QPushButton("暂停")
+        self.notice_pause_button = QPushButton("暂停计时")
         self.notice_pause_button.setObjectName("noticeActionButton")
         self.notice_pause_button.clicked.connect(self._pause_after_ai)
+        self.notice_suspend_button = QPushButton("暂存")
+        self.notice_suspend_button.setObjectName("noticeActionButton")
+        self.notice_suspend_button.clicked.connect(self._suspend_after_ai)
         self.notice_complete_button = QPushButton("完成")
         self.notice_complete_button.setObjectName("noticePrimaryActionButton")
         self.notice_complete_button.clicked.connect(self._complete_after_ai)
@@ -738,6 +759,7 @@ class PetWindow(QWidget):
         self.daily_plan_skip_button.clicked.connect(self._skip_daily_planning)
         self.notice_action_row.addWidget(self.notice_continue_button)
         self.notice_action_row.addWidget(self.notice_pause_button)
+        self.notice_action_row.addWidget(self.notice_suspend_button)
         self.notice_action_row.addWidget(self.notice_complete_button)
         self.notice_action_row.addWidget(self.notice_undo_button)
         self.notice_action_row.addWidget(self.daily_plan_start_button)
@@ -756,6 +778,7 @@ class PetWindow(QWidget):
         self.notice_action_row.setEnabled(False)
         self.notice_continue_button.hide()
         self.notice_pause_button.hide()
+        self.notice_suspend_button.hide()
         self.notice_complete_button.hide()
         self.notice_undo_button.hide()
         self.daily_plan_start_button.hide()
@@ -911,11 +934,11 @@ class PetWindow(QWidget):
         title = "Codex 已完成" if completed else "Codex 已中断"
         has_focus = self.service.focus is not None
         body = (
-            "Codex 已输出。你可以继续当前微任务，也可以在这里暂停或完成它。"
+            "Codex 已输出。你可以继续计时、暂存当前任务，或直接完成它。"
             if completed and has_focus
             else "可以回到 Codex 查看结果。"
             if completed
-            else "Codex 已中断。你可以继续当前微任务，也可以在这里暂停或完成它。"
+            else "Codex 已中断。你可以继续计时、暂存当前任务，或直接完成它。"
             if has_focus
             else "请回到 Codex 查看中断或失败原因。"
         )
@@ -934,6 +957,7 @@ class PetWindow(QWidget):
         self.notice_action_row.setEnabled(False)
         self.notice_continue_button.hide()
         self.notice_pause_button.hide()
+        self.notice_suspend_button.hide()
         self.notice_complete_button.hide()
         self.notice_undo_button.hide()
         self.daily_plan_start_button.hide()
@@ -946,6 +970,7 @@ class PetWindow(QWidget):
         self.notice_continue_button.setText("继续计时")
         self.notice_continue_button.show()
         self.notice_pause_button.hide()
+        self.notice_suspend_button.hide()
         self.notice_complete_button.show()
 
     def _show_focus_guard_notice(self, focus: FocusSession, limit_minutes: int) -> None:
@@ -969,8 +994,10 @@ class PetWindow(QWidget):
         if self.service.focus is None:
             return
         self.notice_action_row.setEnabled(True)
+        self.notice_continue_button.setText("继续计时")
         self.notice_continue_button.show()
         self.notice_pause_button.show()
+        self.notice_suspend_button.show()
         self.notice_complete_button.show()
 
     def _continue_after_ai(self) -> None:
@@ -986,8 +1013,12 @@ class PetWindow(QWidget):
 
     def _pause_after_ai(self) -> None:
         self.apply_update(
-            self.service.pause_focus(message="Codex 已输出，微任务已暂停")
+            self.service.pause_focus(message="Codex 已输出，计时已暂停")
         )
+        self.dismiss_notice()
+
+    def _suspend_after_ai(self) -> None:
+        self.suspend_focus()
         self.dismiss_notice()
 
     def _complete_after_ai(self) -> None:
@@ -1353,9 +1384,11 @@ class PetWindow(QWidget):
                 self.focus_tag.setVisible(False)
             elapsed_text = format_duration(focus.elapsed_seconds())
             self.focus_time.setText(elapsed_text)
-            self.compact_timer_label.setText(elapsed_text)
+            self.compact_timer_label.setText(
+                ("已暂停 · " if focus.is_paused else "") + elapsed_text
+            )
             self.compact_timer_label.setToolTip(f"{focus.task.title} · {elapsed_text}")
-            self.pause_button.setText("继续计时" if focus.is_paused else "暂停")
+            self.pause_button.setText("继续计时" if focus.is_paused else "暂停计时")
             self.pause_button.setIcon(
                 self.style().standardIcon(
                     QStyle.StandardPixmap.SP_MediaPlay
@@ -1365,12 +1398,11 @@ class PetWindow(QWidget):
             )
             self.switch_button.setEnabled(True)
             self.switch_button.setVisible(True)
+            self.suspend_button.setVisible(True)
             self.abandon_button.setVisible(True)
             self.switch_action.setEnabled(True)
             self.switch_button.setToolTip(
-                "选择另一个 Waiting Task"
-                if focus.is_paused
-                else "自动暂停当前任务，并选择另一个 Waiting Task"
+                "选择另一个 Waiting Task；取消不会改变当前计时"
             )
 
         else:
@@ -1384,16 +1416,21 @@ class PetWindow(QWidget):
             self.switch_button.setEnabled(False)
             self.switch_button.setVisible(False)
             self.switch_action.setEnabled(False)
+            self.suspend_button.setVisible(False)
             self.abandon_button.setVisible(False)
 
         picker_visible = (
             self.task_picker_open
             and not self.page_hidden
-            and (focus is None or focus.is_paused)
+            and (self._task_switcher_open or focus is None or focus.is_paused)
         )
         if picker_visible:
             self.picker_title.setText(
-                "下一件做什么？" if focus is not None else "选一件事，开始专注"
+                "切换到哪一件？"
+                if self._task_switcher_open
+                else "下一件做什么？"
+                if focus is not None
+                else "选一件事，开始专注"
             )
             self._refresh_suggestions()
         notice_visible = self._notice_is_visible() and not self.page_hidden
@@ -1405,6 +1442,7 @@ class PetWindow(QWidget):
                 page_hidden=self.page_hidden,
                 notice_open=notice_visible,
                 focus_paused=focus is not None and focus.is_paused,
+                switcher_open=self._task_switcher_open,
             )
         )
         self.notice_card.setVisible(
@@ -1591,10 +1629,11 @@ class PetWindow(QWidget):
         elif mode is PresentationMode.PLAYER:
             # Keep the Cookie and player readable without turning a short
             # focus session into a wide desktop panel.
-            # Four 44px action targets plus spacing need a little more than
-            # the previous 500px shell; keep the title and controls from
-            # competing for the same row on Windows' native style metrics.
-            width = max(540, self.pet.width() + 452)
+            # Keep all five action targets equal to the pause control so the
+            # player stays compact and the title has a predictable width.
+            # Keep the player compact while leaving enough room for five
+            # equal-width action buttons and their gaps.
+            width = max(590, self.pet.width() + 502)
             margins = (6, 5, 6, 5)
             opacity = 0.96
         elif mode is PresentationMode.COMPACT_PLAYER:
@@ -1657,11 +1696,12 @@ class PetWindow(QWidget):
                     button.setFixedHeight(28)
         if mode is PresentationMode.PLAYER:
             # Qt's stylesheet pass can restore platform button metrics; keep
-            # the four action targets compact and aligned after polishing.
-            self.pause_button.setFixedSize(84, 44)
-            self.switch_button.setFixedSize(72, 44)
-            self.complete_button.setFixedHeight(44)
-            self.abandon_button.setFixedSize(72, 44)
+            # the action targets compact and aligned after polishing.
+            self.pause_button.setFixedSize(PLAYER_ACTION_WIDTH, PLAYER_ACTION_HEIGHT)
+            self.suspend_button.setFixedSize(PLAYER_ACTION_WIDTH, PLAYER_ACTION_HEIGHT)
+            self.switch_button.setFixedSize(PLAYER_ACTION_WIDTH, PLAYER_ACTION_HEIGHT)
+            self.complete_button.setFixedSize(PLAYER_ACTION_WIDTH, PLAYER_ACTION_HEIGHT)
+            self.abandon_button.setFixedSize(PLAYER_ACTION_WIDTH, PLAYER_ACTION_HEIGHT)
             self.player_more_button.setFixedSize(90, 20)
         self.setWindowOpacity(opacity)
         if mode is PresentationMode.PLAYER:
@@ -1716,6 +1756,11 @@ class PetWindow(QWidget):
         minimum = self.minimumSizeHint()
         width = max(width, minimum.width())
         height = max(height, minimum.height())
+        geometry = self._screen_geometry_for_size(width, height)
+        if geometry is not None:
+            margin = 10
+            width = min(width, max(1, geometry.width() - margin * 2))
+            height = min(height, max(1, geometry.height() - margin * 2))
         position = self._clamped_position(width, height)
         if self.pos() != position:
             self.move(position)
@@ -1926,9 +1971,19 @@ class PetWindow(QWidget):
         )
         # Grow to the actual number of rows, while retaining a bounded scroll
         # area for unusually long histories so the desktop pet stays usable.
-        target = min(430, max(56, total_height + 2))
+        target = min(self._completed_list_height_budget(), max(56, total_height + 2))
         self.today_completed_list.setMinimumHeight(target)
         self.today_completed_list.setMaximumHeight(target)
+
+    def _completed_list_height_budget(self) -> int:
+        """Reserve room for the picker controls on short displays."""
+
+        screen = QApplication.screenAt(self.frameGeometry().center())
+        screen = screen or QApplication.primaryScreen()
+        if screen is None:
+            return 240
+        available_height = screen.availableGeometry().height()
+        return max(80, min(430, int(available_height * 0.28)))
 
     def _continue_completed_task(self, summary: CompletedTaskSummary) -> None:
         if self.service.has_active_focus():
@@ -2059,19 +2114,29 @@ class PetWindow(QWidget):
                 include_completed=False,
             )
         ]
-        switching = self.service.focus is not None and self.service.focus.is_paused
+        switching = self._task_switcher_open
         fixed_cycle = self._fixed_cycle_candidates_for_picker()
         paused = self.service.paused_focuses()
         paused_keys = {
             (session.task.id, session.task.kind, session.task.title)
             for session in paused
         }
+        current_key = (
+            (
+                self.service.focus.task.id,
+                self.service.focus.task.kind,
+                self.service.focus.task.title,
+            )
+            if switching and self.service.focus is not None
+            else None
+        )
 
         def available(candidates: list[Task]) -> list[Task]:
             return [
                 task
                 for task in candidates
                 if (task.id, task.kind, task.title) not in paused_keys
+                and (current_key is None or (task.id, task.kind, task.title) != current_key)
             ]
 
         # Both queues are available on the home page.  The switcher uses the
@@ -2098,6 +2163,7 @@ class PetWindow(QWidget):
                 session.task.title,
                 session.task.tag,
                 int(session.elapsed_seconds()),
+                session.is_suspended,
             )
             for session in paused
         )
@@ -2143,21 +2209,38 @@ class PetWindow(QWidget):
                 widget.setParent(None)
                 widget.deleteLater()
         if paused:
-            paused_title = QLabel("已暂停任务（点击继续）")
-            paused_title.setObjectName("muted")
-            self.suggestion_layout.addWidget(paused_title)
-            for session in paused:
-                button = QPushButton(
-                    f"↻  {session.task.title}  ·  {format_duration(session.elapsed_seconds())}"
-                )
-                button.setObjectName("pausedTaskButton")
-                button.setFixedHeight(32)
-                button.setCursor(Qt.CursorShape.PointingHandCursor)
-                button.setToolTip("继续这个已暂停的 Waiting Task")
-                button.clicked.connect(
-                    lambda _checked=False, selected=session.task: self.start_focus(selected)
-                )
-                self.suggestion_layout.addWidget(button)
+            paused_groups = [
+                (
+                    "已暂存任务（点击继续）",
+                    [session for session in paused if session.is_suspended],
+                ),
+                (
+                    "已暂停计时（点击继续）",
+                    [session for session in paused if not session.is_suspended],
+                ),
+            ]
+            for title, sessions in paused_groups:
+                if not sessions:
+                    continue
+                paused_title = QLabel(title)
+                paused_title.setObjectName("muted")
+                self.suggestion_layout.addWidget(paused_title)
+                for session in sessions:
+                    button = QPushButton(
+                        f"↻  {session.task.title}  ·  累计 {format_duration(session.elapsed_seconds())}"
+                    )
+                    button.setObjectName("pausedTaskButton")
+                    button.setFixedHeight(32)
+                    button.setCursor(Qt.CursorShape.PointingHandCursor)
+                    button.setToolTip(
+                        "继续这个已暂存的 Waiting Task"
+                        if session.is_suspended
+                        else "继续这个已暂停计时的 Waiting Task"
+                    )
+                    button.clicked.connect(
+                        lambda _checked=False, selected=session.task: self.start_focus(selected)
+                    )
+                    self.suggestion_layout.addWidget(button)
         if not tasks and not paused:
             empty = QLabel("暂无可用任务，请在任务管理中添加任务或启用循环任务。")
             empty.setObjectName("muted")
@@ -2355,41 +2438,58 @@ class PetWindow(QWidget):
             self.refresh()
 
     def start_focus(self, task: Task) -> None:
-        if self.service.has_active_focus():
+        switching = self._task_switcher_open
+        if not switching and self.service.has_active_focus():
             self.apply_update(
                 self.service.pause_focus(message="褰撳墠浠诲姟宸叉殏鍋滐紝姝ｅ湪鍒囨崲浠诲姟")
             )
-        if self.service.has_active_focus():
+        if not switching and self.service.has_active_focus():
             self.last_message = "请先暂停当前微任务，再切换任务"
             self.refresh()
             return
         self.task_picker_open = False
+        self._task_switcher_open = False
         self._invalidate_fixed_cycle_candidates()
         self._paused_signature = None
-        self.apply_update(self.service.start_focus(task))
+        update = self.service.switch_focus(task) if switching else self.service.start_focus(task)
+        self.apply_update(update)
         if self.task_dialog is not None:
             self.task_dialog.hide()
 
     def open_task_switcher(self) -> None:
         focus = self.service.focus
         if focus is None:
+            self._task_switcher_open = False
             self.task_picker_open = True
             self._invalidate_fixed_cycle_candidates()
             self._paused_signature = None
             self.refresh()
             return
-        if not focus.is_paused:
-            self.apply_update(
-                self.service.pause_focus(message="当前任务已暂停，选择另一个任务继续")
-            )
+        self._task_switcher_open = True
         self.task_picker_open = True
         self._invalidate_fixed_cycle_candidates()
         self._paused_signature = None
-        self.last_message = "当前任务已暂停，选择另一个任务继续"
+        self.last_message = "选择另一个任务；取消不会改变当前计时"
         self.refresh()
 
     def toggle_pause(self) -> None:
         self.apply_update(self.service.toggle_focus_pause())
+
+    def suspend_focus(self) -> None:
+        """Save the current progress and return the task to the picker."""
+
+        focus = self.service.focus
+        if focus is None:
+            return
+        suspended_title = focus.task.title
+        self._focus_guard_active = False
+        self._invalidate_fixed_cycle_candidates()
+        self.task_picker_open = True
+        self.apply_update(
+            self.service.suspend_focus(
+                message=f"已暂存：{suspended_title}，仍在任务队列中"
+            )
+        )
 
     def complete_focus(self) -> None:
         self._focus_guard_active = False
@@ -2428,6 +2528,7 @@ class PetWindow(QWidget):
             # when idle, or the full player controls when a task is running.
             self.page_hidden = False
             if self.service.focus is None:
+                self._task_switcher_open = False
                 self.task_picker_open = True
                 self._invalidate_fixed_cycle_candidates()
             self.refresh()
@@ -2438,21 +2539,15 @@ class PetWindow(QWidget):
         if self.service.focus is None or self.service.focus.is_paused:
             self.task_picker_open = not self.task_picker_open
             if self.task_picker_open:
+                self._task_switcher_open = False
                 self._invalidate_fixed_cycle_candidates()
+            else:
+                self._task_switcher_open = False
             self._paused_signature = None
             self.refresh()
 
     def keyPressEvent(self, event: QKeyEvent) -> None:  # noqa: N802
-        if self.service.focus is not None:
-            if event.key() == Qt.Key.Key_Space:
-                self.toggle_pause()
-                event.accept()
-                return
-            if event.key() in {Qt.Key.Key_Return, Qt.Key.Key_Enter}:
-                self.complete_focus()
-                event.accept()
-                return
-        elif self.task_picker_open and Qt.Key.Key_1 <= event.key() <= Qt.Key.Key_3:
+        if self.task_picker_open and Qt.Key.Key_1 <= event.key() <= Qt.Key.Key_3:
             tasks = [
                 *(
                     task.as_task()
@@ -2468,6 +2563,15 @@ class PetWindow(QWidget):
                 self.start_focus(tasks[index])
                 event.accept()
                 return
+        if self.service.focus is not None:
+            if event.key() == Qt.Key.Key_Space:
+                self.toggle_pause()
+                event.accept()
+                return
+            if event.key() in {Qt.Key.Key_Return, Qt.Key.Key_Enter}:
+                self.complete_focus()
+                event.accept()
+                return
         if event.key() == Qt.Key.Key_Escape:
             self.close_picker()
             event.accept()
@@ -2477,12 +2581,13 @@ class PetWindow(QWidget):
     def show_pet_menu(self, global_position: QPoint) -> None:
         menu = QMenu(self)
         if self.service.focus is not None:
-            pause_label = "继续微任务" if self.service.focus.is_paused else "暂停微任务"
+            pause_label = "继续计时" if self.service.focus.is_paused else "暂停计时"
             pause_action = menu.addAction(pause_label)
             pause_action.triggered.connect(self.toggle_pause)
-            if self.service.focus.is_paused:
-                switch_action = menu.addAction("切换微任务")
-                switch_action.triggered.connect(self.open_task_switcher)
+            suspend_action = menu.addAction("暂存任务")
+            suspend_action.triggered.connect(self.suspend_focus)
+            switch_action = menu.addAction("切换微任务")
+            switch_action.triggered.connect(self.open_task_switcher)
             complete_action = menu.addAction("完成微任务")
             complete_action.triggered.connect(self.complete_focus)
             cancel_action = menu.addAction("取消并放回")
@@ -2516,11 +2621,13 @@ class PetWindow(QWidget):
 
     def close_picker(self) -> None:
         self.task_picker_open = False
+        self._task_switcher_open = False
         self._invalidate_fixed_cycle_candidates()
         self.refresh()
 
     def skip_current_round(self) -> None:
         self.task_picker_open = False
+        self._task_switcher_open = False
         self._invalidate_fixed_cycle_candidates()
         self.apply_update(self.service.skip_current_ai_round())
 
@@ -2550,7 +2657,10 @@ class PetWindow(QWidget):
 
     def show_recovery_prompt(self) -> None:
         focus = self.service.focus
-        if focus is None or not self.service.has_recovered_focus:
+        # Deliberately suspended sessions are already waiting in the task
+        # queue.  They must not be presented as an interrupted current task
+        # after a restart, even if an older build left a stale selection id.
+        if focus is None or focus.is_suspended or not self.service.has_recovered_focus:
             return
         dialog = QMessageBox(self)
         dialog.setWindowTitle("继续上次的微任务？")
@@ -2561,6 +2671,7 @@ class PetWindow(QWidget):
         )
         continue_button = dialog.addButton("继续任务", QMessageBox.ButtonRole.AcceptRole)
         end_button = dialog.addButton("结束并放回", QMessageBox.ButtonRole.DestructiveRole)
+        suspend_button = dialog.addButton("暂存到任务队列", QMessageBox.ButtonRole.ActionRole)
         pause_button = dialog.addButton("保持暂停", QMessageBox.ButtonRole.RejectRole)
         dialog.setDefaultButton(continue_button)
         dialog.exec()
@@ -2569,6 +2680,9 @@ class PetWindow(QWidget):
             self.apply_update(self.service.resume_focus(message="已继续上次的微任务"))
         elif clicked is end_button:
             self.apply_update(self.service.abandon_focus())
+        elif clicked is suspend_button:
+            self.task_picker_open = True
+            self.apply_update(self.service.suspend_focus())
         elif clicked is pause_button:
             self.apply_update(ServiceUpdate(message="上次的微任务保持暂停"))
 
@@ -2624,6 +2738,7 @@ class PetWindow(QWidget):
 
         self.page_hidden = True
         self.task_picker_open = False
+        self._task_switcher_open = False
         self.refresh()
         self.show()
         self._apply_native_topmost()
@@ -2831,8 +2946,10 @@ def create_tray(window: PetWindow) -> QSystemTrayIcon:
     start_action.triggered.connect(window.manual_ai_start)
     finish_action = menu.addAction("AI 已完成")
     finish_action.triggered.connect(window.manual_ai_finish)
-    pause_action = menu.addAction("暂停 / 继续微任务")
+    pause_action = menu.addAction("暂停 / 继续计时")
     pause_action.triggered.connect(window.toggle_pause)
+    suspend_action = menu.addAction("暂存当前任务")
+    suspend_action.triggered.connect(window.suspend_focus)
     menu.addSeparator()
     quit_action = menu.addAction("退出")
     quit_action.triggered.connect(window.quit_requested)

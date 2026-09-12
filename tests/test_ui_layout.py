@@ -129,15 +129,14 @@ def test_player_keeps_long_title_and_controls_separated(pet_window, qt_app):
     action_buttons = [button for button in buttons if button.objectName() in {
         "playerButton",
         "playerPrimaryButton",
+        "playerSuspendButton",
         "playerSwitchButton",
         "playerCloseButton",
     }]
-    assert len(action_buttons) == 4
+    assert len(action_buttons) == 5
     widths = {button.objectName(): button.width() for button in action_buttons}
     assert widths["playerButton"] >= 64
-    assert widths["playerPrimaryButton"] >= 96
-    assert widths["playerSwitchButton"] >= 64
-    assert widths["playerCloseButton"] >= 64
+    assert set(widths.values()) == {widths["playerButton"]}
     assert all(button.height() >= 44 for button in action_buttons)
     more_button = pet_window.focus_card.findChild(QToolButton, "playerMoreButton")
     assert more_button is not None and more_button.height() <= 24
@@ -182,7 +181,7 @@ def test_minimized_player_keeps_timer_and_cookie_restores_controls(pet_window, q
     assert pet_window.focus_controls.isVisible()
 
 
-def test_paused_player_can_open_switcher_and_start_another_task(pet_window, qt_app):
+def test_player_can_open_switcher_and_start_another_task(pet_window, qt_app):
     first = pet_window.service.storage.add_manual_task("当前任务")
     second = pet_window.service.storage.add_manual_task("切换后的任务")
     pet_window.start_focus(first)
@@ -197,7 +196,7 @@ def test_paused_player_can_open_switcher_and_start_another_task(pet_window, qt_a
     switch_button.click()
     _flush(qt_app)
     assert pet_window.service.focus is not None
-    assert pet_window.service.focus.is_paused is True
+    assert pet_window.service.focus.is_paused is False
     assert pet_window.task_picker_open is True
     assert pet_window.presentation_mode.value == "picker"
     second_button = next(
@@ -211,6 +210,91 @@ def test_paused_player_can_open_switcher_and_start_another_task(pet_window, qt_a
     assert pet_window.service.focus is not None
     assert pet_window.service.focus.task.id == second.id
     assert [session.task.id for session in pet_window.service.paused_focuses()] == [first.id]
+
+
+def test_canceling_switcher_keeps_current_focus_running(pet_window, qt_app):
+    task = pet_window.service.storage.add_manual_task("取消切换测试")
+    pet_window.start_focus(task)
+    _flush(qt_app)
+
+    pet_window.open_task_switcher()
+    _flush(qt_app)
+    assert pet_window.task_picker_open is True
+    assert pet_window.service.focus is not None
+    assert pet_window.service.focus.is_paused is False
+
+    pet_window.close_picker()
+    _flush(qt_app)
+    assert pet_window.task_picker_open is False
+    assert pet_window._task_switcher_open is False
+    assert pet_window.service.focus is not None
+    assert pet_window.service.focus.task.id == task.id
+    assert pet_window.service.focus.is_paused is False
+
+
+def test_player_can_suspend_task_into_queue_and_resume_it(pet_window, qt_app):
+    task = pet_window.service.storage.add_manual_task("暂存入口任务")
+    pet_window.start_focus(task)
+    _flush(qt_app)
+
+    suspend_button = pet_window.focus_card.findChild(QPushButton, "playerSuspendButton")
+    assert suspend_button is not None and suspend_button.isVisible() is True
+    suspend_button.click()
+    _flush(qt_app)
+
+    assert pet_window.service.focus is None
+    assert pet_window.task_picker_open is True
+    queued_button = next(
+        button
+        for button in pet_window.suggestion_container.findChildren(QPushButton)
+        if button.objectName() == "pausedTaskButton" and task.title in button.text()
+    )
+    assert "累计" in queued_button.text()
+    queued_button.click()
+    _flush(qt_app)
+
+    assert pet_window.service.focus is not None
+    assert pet_window.service.focus.task.id == task.id
+
+
+def test_suspended_task_after_restart_skips_recovery_prompt(qt_app, tmp_path, monkeypatch):
+    path = tmp_path / "waitlab.db"
+    first_storage = Storage(path)
+    first_service = WaitLabService(first_storage)
+    task = first_storage.add_manual_task("重启后仍在暂存队列")
+    first_service.start_focus(task, when=datetime.now(timezone.utc) - timedelta(minutes=2))
+    first_service.suspend_focus(when=datetime.now(timezone.utc) - timedelta(minutes=1))
+    # Reproduce the stale selected id written by the previous packaged build.
+    session = first_storage.list_open_focuses()[0]
+    first_storage.set_setting("active_focus_id", str(session.id))
+    first_storage.close()
+
+    storage = Storage(path)
+    service = WaitLabService(storage)
+    window = PetWindow(service)
+    dialog_calls: list[bool] = []
+
+    def unexpected_recovery_dialog(_dialog):
+        dialog_calls.append(True)
+        return 0
+
+    monkeypatch.setattr(QMessageBox, "exec", unexpected_recovery_dialog)
+    try:
+        assert service.focus is None
+        window.show_recovery_prompt()
+        assert dialog_calls == []
+
+        window.task_picker_open = True
+        window.refresh()
+        _flush(qt_app)
+        assert any(
+            button.objectName() == "pausedTaskButton" and task.title in button.text()
+            for button in window.suggestion_container.findChildren(QPushButton)
+        )
+    finally:
+        window.timer.stop()
+        window.close()
+        storage.close()
 
 
 def test_switcher_includes_fixed_cycle_tasks_with_manual_tasks(pet_window, qt_app):
@@ -477,6 +561,18 @@ def test_pet_window_mode_changes_keep_valid_size_constraints(pet_window, qt_app)
         assert pet_window.minimumHeight() <= pet_window.maximumHeight()
         assert pet_window.maximumWidth() >= 16_000_000
         assert pet_window.maximumHeight() >= 16_000_000
+
+
+def test_pet_window_geometry_is_capped_to_available_screen(pet_window, qt_app):
+    screen = QApplication.primaryScreen()
+    assert screen is not None
+    available = screen.availableGeometry()
+
+    pet_window._apply_window_geometry(100_000, 100_000)
+    _flush(qt_app)
+
+    assert pet_window.width() <= available.width() - 20
+    assert pet_window.height() <= available.height() - 20
 
 
 def test_home_quick_add_can_assign_a_tag(pet_window, qt_app):
@@ -825,6 +921,25 @@ def test_task_manager_default_width_never_clips_task_actions(qt_app, tmp_path):
         storage.close()
 
 
+def test_task_row_wraps_long_title_before_eliding(qt_app, tmp_path):
+    storage = Storage(tmp_path / "waitlab.db")
+    service = WaitLabService(storage)
+    title = ("这是一个需要保留完整语义的长任务标题 " * 8).strip()
+    storage.add_manual_task(title)
+    dialog = TaskManagerDialog(service)
+    try:
+        dialog.show()
+        _flush(qt_app)
+        row = dialog.list_widget.itemWidget(dialog.list_widget.item(0))
+        assert row is not None
+        assert row.title_label.toolTip() == title
+        assert "\n" in row.title_label.text()
+        assert row.title_label.height() <= row.height()
+    finally:
+        dialog.close()
+        storage.close()
+
+
 def test_task_planning_history_dialog_lists_date_changes(qt_app, tmp_path):
     storage = Storage(tmp_path / "waitlab.db")
     service = WaitLabService(storage)
@@ -1095,6 +1210,8 @@ def test_task_pool_search_and_undo_delete(qt_app, tmp_path):
     try:
         dialog.show()
         qt_app.processEvents()
+        assert dialog.filter_panel.isVisible()
+        assert dialog.tag_filter_panel.isVisible()
         dialog.task_search.setText("图表")
         qt_app.processEvents()
         assert dialog.list_widget.count() == 1
@@ -1107,6 +1224,30 @@ def test_task_pool_search_and_undo_delete(qt_app, tmp_path):
         assert len(storage.list_manual_tasks()) == 1
         dialog._undo_delete()
         assert len(storage.list_manual_tasks()) == 2
+    finally:
+        dialog.close()
+        storage.close()
+
+
+def test_task_pool_search_can_find_completed_tasks(qt_app, tmp_path):
+    storage = Storage(tmp_path / "waitlab.db")
+    service = WaitLabService(storage)
+    completed = storage.add_manual_task("已完成但需要查找")
+    storage.set_manual_task_completed(completed.id, True)
+    dialog = TaskManagerDialog(service)
+    try:
+        dialog.show()
+        qt_app.processEvents()
+        dialog.task_search.setText("需要查找")
+        qt_app.processEvents()
+
+        rows = [
+            dialog.list_widget.itemWidget(dialog.list_widget.item(index))
+            for index in range(dialog.list_widget.count())
+        ]
+        task_rows = [row for row in rows if row is not None]
+        assert len(task_rows) == 1
+        assert task_rows[0].title_label.text() == "已完成但需要查找"
     finally:
         dialog.close()
         storage.close()

@@ -28,7 +28,7 @@ def _read_project_version() -> str:
     except PackageNotFoundError:
         # This fallback is only for unusual source layouts where neither the
         # project file nor installed package metadata is available.
-        return "0.5.18"
+        return "0.5.19"
 
 
 __version__ = _read_project_version()

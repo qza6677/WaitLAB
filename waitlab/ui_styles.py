@@ -185,13 +185,14 @@ def window_stylesheet() -> str:
     }}
     QPushButton#secondaryButton:hover {{ background: #E1F3EA; border-color: {COLORS['mint']}; }}
     QPushButton#playerButton, QPushButton#playerPrimaryButton {{
-        min-height: 44px; padding: 7px 12px; border-radius: 9px;
+        min-width: 84px; max-width: 84px; min-height: 44px; max-height: 44px;
+        padding: 7px 8px; border-radius: 9px;
         font-family: 'Microsoft YaHei UI'; font-size: 10px;
     }}
     QPushButton#playerSwitchButton {{
         color: {COLORS['mint_dark']}; background: #EDF8F3; border-color: #CBE8DA;
-        min-width: 72px; max-width: 72px; min-height: 44px; max-height: 44px;
-        padding: 7px 10px; border-radius: 9px;
+        min-width: 84px; max-width: 84px; min-height: 44px; max-height: 44px;
+        padding: 7px 8px; border-radius: 9px;
         font-family: 'Microsoft YaHei UI'; font-size: 11px;
     }}
     QPushButton#playerSwitchButton:disabled {{
@@ -210,10 +211,18 @@ def window_stylesheet() -> str:
     }}
     QPushButton#playerCloseButton {{
         background: transparent; border: 1px solid {COLORS['line']}; color: {COLORS['muted']};
-        min-width: 72px; max-width: 72px; min-height: 44px; padding: 3px 5px; border-radius: 9px;
+        min-width: 84px; max-width: 84px; min-height: 44px; max-height: 44px;
+        padding: 3px 5px; border-radius: 9px;
         font-family: 'Microsoft YaHei UI'; font-size: 10px; line-height: 1.0;
     }}
     QPushButton#playerCloseButton:hover {{ color: #A5533D; background: #FFE9DE; }}
+    QPushButton#playerSuspendButton {{
+        background: transparent; border: 1px solid {COLORS['line']}; color: {COLORS['muted']};
+        min-width: 84px; max-width: 84px; min-height: 44px; max-height: 44px;
+        padding: 3px 5px; border-radius: 9px;
+        font-family: 'Microsoft YaHei UI'; font-size: 10px; line-height: 1.0;
+    }}
+    QPushButton#playerSuspendButton:hover {{ color: {COLORS['mint_dark']}; background: #EAF4EE; }}
     QPushButton#taskButton {{
         text-align: left; min-height: 32px; max-height: 32px; padding: 4px 4px;
         color: {COLORS['ink']}; background: transparent; border: none; border-radius: 7px;

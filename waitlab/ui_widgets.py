@@ -23,6 +23,7 @@ from PySide6.QtCore import (
 )
 from PySide6.QtGui import (
     QColor,
+    QFontMetrics,
     QIcon,
     QImage,
     QMouseEvent,
@@ -373,6 +374,30 @@ TASK_ROW_HEIGHT = 40
 TASK_ROW_CONTROL_HEIGHT = 30
 
 
+def _two_line_elided_text(text: str, font_metrics: QFontMetrics, width: int) -> str:
+    """Keep a task title readable in two lines at narrow widths."""
+
+    clean = " ".join(str(text).split())
+    available = max(1, int(width))
+    if font_metrics.horizontalAdvance(clean) <= available:
+        return clean
+    low, high = 1, len(clean)
+    best = 0
+    while low <= high:
+        middle = (low + high) // 2
+        if font_metrics.horizontalAdvance(clean[:middle]) <= available:
+            best = middle
+            low = middle + 1
+        else:
+            high = middle - 1
+    if best <= 0:
+        return font_metrics.elidedText(clean, Qt.TextElideMode.ElideRight, available)
+    first = clean[:best].rstrip()
+    remainder = clean[best:].lstrip()
+    second = font_metrics.elidedText(remainder, Qt.TextElideMode.ElideRight, available)
+    return f"{first}\n{second}"
+
+
 class TagPickerButton(QPushButton):
     """A compact colored tag chip that opens an inline selection menu."""
 
@@ -490,7 +515,7 @@ class TagPickerButton(QPushButton):
         self.popup_requested.emit(self)
 
     def _apply_current_style(self) -> None:
-        accent, _foreground, background, border = tag_palette_for_tag(
+        accent, foreground, background, border = tag_palette_for_tag(
             self._selected,
             self._tone_map,
         )
@@ -501,7 +526,7 @@ class TagPickerButton(QPushButton):
         self.setToolTip(f"当前标签：{self._selected}；点击修改")
         self.setStyleSheet(
             "QPushButton#taskTagButton {"
-            f"color:{accent}; background:{background}; border:1px solid {border};"
+            f"color:{foreground}; background:{background}; border:1px solid {border};"
             "border-radius:9px; padding:0 18px;"
             "font-size:10px; font-weight:650; text-align:center;"
             "}"
@@ -681,7 +706,7 @@ class TagPickerPopup(QFrame):
 
 
 class TaskRowWidget(QWidget):
-    """A single-line, directly actionable task row used by daily planning."""
+    """A compact actionable task row with a two-line title fallback."""
 
     action_requested = Signal(str)
     checked_changed = Signal(bool)
@@ -733,7 +758,10 @@ class TaskRowWidget(QWidget):
         self.title_label.setWordWrap(False)
         self.title_label.setSizePolicy(
             QSizePolicy.Policy.Ignored,
-            QSizePolicy.Policy.Fixed,
+            QSizePolicy.Policy.Preferred,
+        )
+        self.title_label.setMaximumHeight(
+            self.title_label.fontMetrics().lineSpacing() * 2 + 2
         )
         layout.addWidget(self.title_label, 1, Qt.AlignmentFlag.AlignVCenter)
 
@@ -842,11 +870,7 @@ class TaskRowWidget(QWidget):
         super().resizeEvent(event)
         available = max(1, self.title_label.contentsRect().width())
         self.title_label.setText(
-            self.title_label.fontMetrics().elidedText(
-                self._full_title,
-                Qt.TextElideMode.ElideRight,
-                available,
-            )
+            _two_line_elided_text(self._full_title, self.title_label.fontMetrics(), available)
         )
 
     def _on_checked(self, checked: bool) -> None:
@@ -863,7 +887,7 @@ class TaskRowWidget(QWidget):
 
 
 class FixedTaskRowWidget(QWidget):
-    """Single-line editor row for one fixed task entry."""
+    """Compact editor row for one fixed task entry."""
 
     action_requested = Signal(str)
     enabled_changed = Signal(bool)
@@ -905,7 +929,11 @@ class FixedTaskRowWidget(QWidget):
         self.title_label.setWordWrap(False)
         self.title_label.setSizePolicy(
             QSizePolicy.Policy.Ignored,
-            QSizePolicy.Policy.Fixed,
+            QSizePolicy.Policy.Preferred,
+        )
+        self._full_title = entry.title
+        self.title_label.setMaximumHeight(
+            self.title_label.fontMetrics().lineSpacing() * 2 + 2
         )
         layout.addWidget(self.title_label, 1, Qt.AlignmentFlag.AlignVCenter)
 
@@ -955,6 +983,13 @@ class FixedTaskRowWidget(QWidget):
         delete_action.triggered.connect(lambda: self.action_requested.emit("delete"))
         self.more_button.setMenu(self.more_menu)
         layout.addWidget(self.more_button, 0, Qt.AlignmentFlag.AlignVCenter)
+
+    def resizeEvent(self, event: QResizeEvent) -> None:  # noqa: N802
+        super().resizeEvent(event)
+        available = max(1, self.title_label.contentsRect().width())
+        self.title_label.setText(
+            _two_line_elided_text(self._full_title, self.title_label.fontMetrics(), available)
+        )
 
     def _on_enabled_changed(self, enabled: bool) -> None:
         self.enabled_checkbox.setToolTip(

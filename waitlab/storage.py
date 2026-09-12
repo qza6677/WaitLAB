@@ -82,6 +82,10 @@ class Storage:
             self._connection.execute(
                 "ALTER TABLE focus_sessions ADD COLUMN last_heartbeat_at TEXT"
             )
+        if "suspended_at" not in focus_columns:
+            self._connection.execute(
+                "ALTER TABLE focus_sessions ADD COLUMN suspended_at TEXT"
+            )
         if "task_tag" not in focus_columns:
             self._connection.execute(
                 "ALTER TABLE focus_sessions ADD COLUMN task_tag TEXT NOT NULL DEFAULT '未分类'"
@@ -188,7 +192,7 @@ class Storage:
             """
         )
         self._migrate_default_content()
-        self._connection.execute("PRAGMA user_version = 6")
+        self._connection.execute("PRAGMA user_version = 7")
         self._connection.commit()
 
     def _migrate_default_content(self) -> None:
@@ -274,6 +278,24 @@ class Storage:
     ) -> Task:
         return self._tasks.add_manual_task(
             title,
+            tag,
+            planned_date,
+            priority=priority,
+            due_date=due_date,
+        )
+
+
+    def add_manual_tasks(
+        self,
+        titles: list[str],
+        tag: str = DEFAULT_TAG,
+        planned_date: str | datetime | None = None,
+        *,
+        priority: int = 0,
+        due_date: str | datetime | None = None,
+    ) -> list[Task]:
+        return self._tasks.add_manual_tasks(
+            titles,
             tag,
             planned_date,
             priority=priority,
@@ -425,6 +447,13 @@ class Storage:
 
     def set_default_task_entries(self, entries: list[DefaultTaskEntry]) -> None:
         self._tasks.set_default_task_entries(entries)
+
+
+    def merge_default_task_entries(
+        self,
+        defaults: list[DefaultTaskEntry],
+    ) -> list[DefaultTaskEntry]:
+        return self._tasks.merge_default_task_entries(defaults)
 
 
     def _set_default_task_entries_uncommitted(self, entries: list[DefaultTaskEntry]) -> None:
@@ -688,3 +717,13 @@ class Storage:
     def set_setting(self, key: str, value: str) -> None:
         self._set_setting_uncommitted(key, value)
         self._connection.commit()
+
+    def set_focus_selection(self, focus_id: int | None, state: str) -> None:
+        """Persist the selected focus and queue marker in one transaction."""
+
+        with self._connection:
+            self._set_setting_uncommitted(
+                "active_focus_id",
+                str(focus_id) if focus_id is not None else "",
+            )
+            self._set_setting_uncommitted("focus_selection_state", state)

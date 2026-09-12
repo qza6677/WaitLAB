@@ -234,9 +234,12 @@ def choose_presentation_mode(
     page_hidden: bool = False,
     notice_open: bool = False,
     focus_paused: bool = False,
+    switcher_open: bool = False,
 ) -> PresentationMode:
     """Choose the visible pet layout from independent UI state flags."""
 
+    if switcher_open and picker_open and not page_hidden:
+        return PresentationMode.PICKER
     if has_focus and not (picker_open and focus_paused):
         return (
             PresentationMode.COMPACT_PLAYER

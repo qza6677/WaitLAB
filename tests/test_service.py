@@ -32,6 +32,24 @@ def test_manual_tasks_completely_replace_default_suggestions(service):
     assert all(task.kind is TaskKind.MANUAL for task in suggestions)
 
 
+def test_batch_manual_task_creation_is_ordered_and_atomic(service):
+    created = service.add_manual_tasks(["第一项", "  第二项  "], tag="批量")
+
+    assert [task.title for task in created] == ["第一项", "第二项"]
+    assert [task.sort_order for task in created] == [0, 1]
+    assert [task.title for task in service.storage.list_manual_tasks()] == [
+        "第一项",
+        "第二项",
+    ]
+
+    with pytest.raises(ValueError):
+        service.add_manual_tasks(["第三项", "   "], tag="批量")
+    assert [task.title for task in service.storage.list_manual_tasks()] == [
+        "第一项",
+        "第二项",
+    ]
+
+
 def test_service_end_time_update_invalidates_statistics_cache(service, monkeypatch):
     task = service.storage.add_manual_task("服务层修正结束时间")
     started = moment()
@@ -417,6 +435,55 @@ def test_focus_pause_only_changes_focus_clock(service):
     assert service.focus.elapsed_seconds(moment(5)) == pytest.approx(60)
 
 
+def test_suspend_focus_releases_current_task_and_preserves_elapsed_time(service):
+    task = service.storage.add_manual_task("暂存后继续的任务")
+    service.start_focus(task, when=moment())
+
+    update = service.suspend_focus(when=moment(5))
+
+    assert update.focus_changed is True
+    assert service.focus is None
+    suspended = service.suspended_focuses()
+    assert [session.task.id for session in suspended] == [task.id]
+    assert suspended[0].is_paused is True
+    assert suspended[0].is_suspended is True
+    assert suspended[0].elapsed_seconds(moment(30)) == pytest.approx(5 * 60)
+    assert service.storage.get_setting("active_focus_id") == ""
+    assert service.storage.get_setting("focus_selection_state") == "queue"
+
+    service.start_focus(task, when=moment(15))
+
+    assert service.focus is not None
+    assert service.focus.is_suspended is False
+    assert service.focus.elapsed_seconds(moment(20)) == pytest.approx(10 * 60)
+
+
+def test_suspended_focus_stays_in_queue_after_restart(tmp_path):
+    path = tmp_path / "waitlab.db"
+    first_storage = Storage(path)
+    first_service = WaitLabService(first_storage)
+    task = first_storage.add_manual_task("重启后仍在队列")
+    first_service.start_focus(task, when=moment())
+    first_service.suspend_focus(when=moment(4))
+    # Older builds could leave the selected session id behind even after
+    # marking the task as queued.  A restart must trust the queue marker and
+    # repair that stale selection instead of reopening the task as current.
+    session = first_storage.list_open_focuses()[0]
+    first_storage.set_setting("active_focus_id", str(session.id))
+    first_storage.close()
+
+    second_storage = Storage(path)
+    second_service = WaitLabService(second_storage)
+    try:
+        assert second_service.focus is None
+        queued = second_service.suspended_focuses()
+        assert [session.task.id for session in queued] == [task.id]
+        assert queued[0].elapsed_seconds(moment(20)) == pytest.approx(4 * 60)
+        assert second_storage.get_setting("active_focus_id") == ""
+    finally:
+        second_storage.close()
+
+
 def test_paused_focus_can_switch_and_resume_each_task_independently(service):
     first = service.storage.add_manual_task("第一个任务")
     second = service.storage.add_manual_task("第二个任务")
@@ -441,6 +508,24 @@ def test_paused_focus_can_switch_and_resume_each_task_independently(service):
     paused = service.paused_focuses()
     assert [session.task.id for session in paused] == [second.id]
     assert paused[0].elapsed_seconds(moment(14)) == pytest.approx(4 * 60)
+
+
+def test_switch_focus_commits_pause_only_when_target_is_selected(service):
+    first = service.storage.add_manual_task("当前工作")
+    second = service.storage.add_manual_task("下一项工作")
+
+    service.start_focus(first, when=moment())
+    assert service.focus is not None and service.focus.is_paused is False
+
+    update = service.switch_focus(second, when=moment(5))
+
+    assert update.focus_changed is True
+    assert service.focus is not None
+    assert service.focus.task.id == second.id
+    assert service.focus.is_paused is False
+    paused = service.paused_focuses()
+    assert [session.task.id for session in paused] == [first.id]
+    assert paused[0].elapsed_seconds(moment(10)) == pytest.approx(5 * 60)
 
 
 def test_switched_paused_focuses_are_restored_after_restart(tmp_path):
@@ -600,6 +685,7 @@ def test_existing_database_is_migrated_with_heartbeat_column(tmp_path):
     }
 
     assert "last_heartbeat_at" in columns
+    assert "suspended_at" in columns
     storage.close()
 
 

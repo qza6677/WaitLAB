@@ -131,6 +131,7 @@ class FocusRepository:
             started_at=started_at,
             paused_seconds=float(row["paused_seconds"]),
             paused_at=from_iso(row["paused_at"]),
+            suspended_at=from_iso(row["suspended_at"]),
             last_heartbeat_at=from_iso(row["last_heartbeat_at"]),
         )
 
@@ -154,12 +155,13 @@ class FocusRepository:
             self._connection.execute(
                 """
                 UPDATE focus_sessions
-                SET paused_seconds = ?, paused_at = ?, last_heartbeat_at = ?
+                SET paused_seconds = ?, paused_at = ?, suspended_at = ?, last_heartbeat_at = ?
                 WHERE id = ?
                 """,
                 (
                     session.paused_seconds,
                     to_iso(session.paused_at),
+                    to_iso(session.suspended_at),
                     to_iso(session.last_heartbeat_at),
                     session.id,
                 ),
@@ -209,7 +211,8 @@ class FocusRepository:
             self._connection.execute(
                 """
                 UPDATE focus_sessions
-                SET ended_at = ?, paused_seconds = ?, paused_at = NULL, outcome = ?
+                SET ended_at = ?, paused_seconds = ?, paused_at = NULL,
+                    suspended_at = NULL, outcome = ?
                 WHERE id = ?
                 """,
                 (to_iso(ended_at), paused_seconds, outcome.value, session.id),
@@ -232,7 +235,8 @@ class FocusRepository:
                 self._connection.execute(
                     """
                     UPDATE focus_sessions
-                    SET ended_at = ?, paused_seconds = ?, paused_at = NULL, outcome = ?
+                    SET ended_at = ?, paused_seconds = ?, paused_at = NULL,
+                        suspended_at = NULL, outcome = ?
                     WHERE id = ? AND ended_at IS NULL
                     """,
                     (to_iso(ended_at), paused_seconds, outcome.value, session.id),
@@ -349,7 +353,8 @@ class FocusRepository:
                 self._connection.execute(
                     """
                     UPDATE focus_sessions
-                    SET ended_at = ?, paused_seconds = ?, paused_at = NULL
+                    SET ended_at = ?, paused_seconds = ?, paused_at = NULL,
+                        suspended_at = NULL
                     WHERE id = ? AND outcome = 'completed'
                     """,
                     (new_end_iso, paused_seconds, session_id),

@@ -14,6 +14,7 @@ class FocusCoordinator:
     def __init__(self, storage: Storage, stats_cache: StatsCache) -> None:
         self.storage = storage
         self.stats_cache = stats_cache
+        selection_state = storage.get_setting("focus_selection_state", "")
         selected_focus_id = self._read_focus_id(
             storage.get_setting("active_focus_id", "")
         )
@@ -23,24 +24,49 @@ class FocusCoordinator:
             if not session.is_paused:
                 self.storage.recover_open_focus(session)
         open_focuses = storage.list_open_focuses()
-        selected = next(
-            (session for session in open_focuses if session.id == selected_focus_id),
-            None,
-        )
-        if selected is None and running_before_recovery is not None:
+        selected = None
+        if selection_state != "queue":
             selected = next(
-                (session for session in open_focuses if session.id == running_before_recovery.id),
+                (
+                    session
+                    for session in open_focuses
+                    if session.id == selected_focus_id and not session.is_suspended
+                ),
                 None,
             )
-        self.focus: FocusSession | None = selected or (
-            open_focuses[-1] if open_focuses else None
-        )
+            if selected is None and running_before_recovery is not None:
+                selected = next(
+                    (
+                        session
+                        for session in open_focuses
+                        if session.id == running_before_recovery.id and not session.is_suspended
+                    ),
+                    None,
+                )
+            # Keep the legacy recovery behavior for databases created before
+            # the queue-selection marker was introduced.
+            if selected is None and selection_state != "queue":
+                selected = next(
+                    (session for session in reversed(open_focuses) if not session.is_suspended),
+                    None,
+                )
+        self.focus: FocusSession | None = selected
         self._paused_focuses: dict[int, FocusSession] = {
             session.id: session
             for session in open_focuses
             if self.focus is None or session.id != self.focus.id
         }
-        self._persist_focus_selection(self.focus)
+        self._persist_focus_selection(
+            self.focus,
+            queued=(
+                self.focus is None
+                and bool(self._paused_focuses)
+                and (
+                    selection_state == "queue"
+                    or any(session.is_suspended for session in self._paused_focuses.values())
+                )
+            ),
+        )
         self.has_recovered_focus = bool(open_focuses)
 
     @staticmethod
@@ -51,8 +77,25 @@ class FocusCoordinator:
             return None
         return focus_id if focus_id > 0 else None
 
-    def _persist_focus_selection(self, focus: FocusSession | None) -> None:
-        self.storage.set_setting("active_focus_id", str(focus.id) if focus is not None else "")
+    def _persist_focus_selection(
+        self,
+        focus: FocusSession | None,
+        *,
+        queued: bool = False,
+    ) -> None:
+        """Persist the selected player focus and whether the queue is shown.
+
+        An empty ``active_focus_id`` used to mean both "nothing is selected"
+        and "there is no setting yet".  The explicit state marker lets a
+        deliberately suspended task remain in the queue after a restart,
+        while old databases keep their previous recovery behavior.  A queued
+        session also repairs a stale selection id left by older builds.
+        """
+
+        self.storage.set_focus_selection(
+            focus.id if focus is not None else None,
+            "active" if focus is not None else "queue" if queued else "idle",
+        )
 
     def suggested_tasks(self) -> list[Task]:
         return self.storage.suggested_tasks(limit=3)
@@ -90,12 +133,17 @@ class FocusCoordinator:
         return self.focus is not None and not self.focus.is_paused
 
     def paused_focuses(self) -> list[FocusSession]:
-        """Return paused sessions, including the currently selected one."""
+        """Return timing-paused sessions, including queued suspensions."""
     
         sessions = list(self._paused_focuses.values())
         if self.focus is not None and self.focus.is_paused:
             sessions.append(self.focus)
         return sorted(sessions, key=lambda session: session.id, reverse=True)
+
+    def suspended_focuses(self) -> list[FocusSession]:
+        """Return unfinished sessions explicitly returned to the task queue."""
+
+        return [session for session in self.paused_focuses() if session.is_suspended]
 
     def open_focuses(self) -> list[FocusSession]:
         """Return every unfinished focus session for task-safety checks."""
@@ -117,6 +165,7 @@ class FocusCoordinator:
             (current - session.paused_at).total_seconds(),
         )
         session.paused_at = None
+        session.suspended_at = None
         session.last_heartbeat_at = current
         self.storage.save_focus_pause(session)
 
@@ -142,6 +191,32 @@ class FocusCoordinator:
         self.stats_cache.invalidate()
         return ServiceUpdate(focus_changed=True, message=message)
 
+    @staticmethod
+    def _same_task(left: Task, right: Task) -> bool:
+        if left.kind is not right.kind or left.title != right.title:
+            return False
+        return left.kind is TaskKind.DEFAULT or left.id == right.id
+
+    def switch_focus(self, task: Task, when: datetime | None = None) -> ServiceUpdate:
+        """Switch tasks after the user confirms a picker choice.
+
+        Opening the picker is intentionally side-effect free.  This method is
+        the single commit point: pause the current session, then resume or
+        create the selected session.
+        """
+
+        if self.focus is None:
+            return self.start_focus(task, when)
+        if self._same_task(self.focus.task, task):
+            return ServiceUpdate(message="仍在当前微任务")
+        current = when or utc_now()
+        if not self.focus.is_paused:
+            self.focus.paused_at = current
+            self.focus.last_heartbeat_at = current
+            self.storage.save_focus_pause(self.focus)
+        self._paused_focuses[self.focus.id] = self.focus
+        return self.start_focus(task, current)
+
     def toggle_focus_pause(self, when: datetime | None = None) -> ServiceUpdate:
         if self.focus is None:
             return ServiceUpdate()
@@ -161,6 +236,28 @@ class FocusCoordinator:
         self.focus.last_heartbeat_at = current
         self._persist_focus_selection(self.focus)
         self.storage.save_focus_pause(self.focus)
+        self.stats_cache.invalidate()
+        return ServiceUpdate(focus_changed=True, message=message)
+
+    def suspend_focus(
+        self,
+        when: datetime | None = None,
+        message: str = "任务已暂存，仍在任务队列中",
+    ) -> ServiceUpdate:
+        """Pause and release the current unfinished task back to the queue."""
+
+        if self.focus is None:
+            return ServiceUpdate()
+        current = when or utc_now()
+        session = self.focus
+        if session.paused_at is None:
+            session.paused_at = current
+            session.last_heartbeat_at = current
+        session.suspended_at = current
+        self.storage.save_focus_pause(session)
+        self._paused_focuses[session.id] = session
+        self.focus = None
+        self._persist_focus_selection(None, queued=True)
         self.stats_cache.invalidate()
         return ServiceUpdate(focus_changed=True, message=message)
 
@@ -188,7 +285,7 @@ class FocusCoordinator:
         completed = self.focus
         self.storage.finish_focus_and_task(completed, FocusOutcome.COMPLETED, when=when)
         self.stats_cache.invalidate()
-        self._persist_focus_selection(None)
+        self._persist_focus_selection(None, queued=bool(self._paused_focuses))
         self.focus = None
         return ServiceUpdate(focus_changed=True, message="微任务完成，做得漂亮")
 
@@ -198,6 +295,6 @@ class FocusCoordinator:
         abandoned = self.focus
         self.storage.finish_focus_and_task(abandoned, FocusOutcome.ABANDONED, when=when)
         self.stats_cache.invalidate()
-        self._persist_focus_selection(None)
+        self._persist_focus_selection(None, queued=bool(self._paused_focuses))
         self.focus = None
         return ServiceUpdate(focus_changed=True, message="任务已放回任务池")

@@ -23,6 +23,13 @@ def test_focus_always_uses_player_mode():
     assert choose_presentation_mode(True, True) is PresentationMode.PLAYER
 
 
+def test_confirmed_switcher_uses_picker_before_focus_changes():
+    assert (
+        choose_presentation_mode(True, True, switcher_open=True)
+        is PresentationMode.PICKER
+    )
+
+
 def test_hidden_page_keeps_active_task_in_compact_player():
     assert (
         choose_presentation_mode(True, False, page_hidden=True)
